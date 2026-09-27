@@ -2254,6 +2254,7 @@ from .tools.meta import (  # noqa: E402,F401
     list_alert_policies,
     list_api_keys,
     list_connected_providers,
+    list_installed_packs,
     list_pinned_views,
     list_profiles,
     list_savings_recommendations,
@@ -2285,6 +2286,12 @@ from .tools.notifications import (  # noqa: E402,F401
     send_report_now,
     send_weekly_digest_now,
     subscribe_to_report,
+)
+from .tools.org import (  # noqa: E402,F401
+    get_org_coverage,
+    get_org_model,
+    list_org_questions,
+    propose_org_fact,
 )
 from .tools.recommendations import (  # noqa: E402,F401
     dismiss_recommendation,

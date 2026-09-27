@@ -21,6 +21,7 @@ For accurate multi-region pricing, use INFRACOST_API_KEY (optional).
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -157,6 +158,7 @@ class CostLine:
     monthly_delta: float  # positive = cost increase, negative = saving
     detail: str           # human note about what drove the price
     confidence: str = "medium"   # low / medium / high
+    price_book: str = ""  # the pack whose price book priced it, "" for list
 
 
 def _sign(rc: ResourceChange) -> int:
@@ -176,27 +178,74 @@ def _action_label(rc: ResourceChange) -> str:
     return "change"
 
 
+def _book_hourly(sku: str) -> tuple[float, str] | None:
+    """(hourly USD rate, pack id) from an installed price book (a pack's
+    price_books) for an AWS SKU, or None: then the list tables price it,
+    exactly as with no pack installed."""
+    if not sku:
+        return None
+    try:
+        from ..guard_packs import rate
+        r = rate("aws", sku)
+    except Exception:
+        return None
+    return (r["usd"], r["pack"]) if r else None
+
+
+# Set while estimate_plan works out the figure a gate judges by (see
+# gate_monthly_delta_usd there): a price book may then raise a cost, never
+# lower one.
+_JUDGING: contextvars.ContextVar[bool] = contextvars.ContextVar("price_book_judging",
+                                                                default=False)
+
+
+def _priced(sku: str, listed: float | None, side: int = 1) -> tuple[float | None, str]:
+    """(hourly rate or None, the pack whose price book gave it, "" for list).
+
+    Shown, a price book's rate replaces the list price. Judged (_JUDGING), it
+    can only make a change look dearer: a cost added (side +1) is the higher
+    of the two, a cost removed (side -1) the lower. A book rate for a SKU the
+    tables do not know is used as it is either way."""
+    book = _book_hourly(sku)
+    if book is None:
+        return listed, ""
+    if listed is None or not _JUDGING.get():
+        return book
+    rate = max(listed, book[0]) if side > 0 else min(listed, book[0])
+    return rate, (book[1] if rate == book[0] and rate != listed else "")
+
+
+def _ec2_hourly(instance_type: str, side: int = 1) -> tuple[float | None, str]:
+    """(hourly rate or None, the pack whose price book gave it, "" for list)."""
+    return _priced(instance_type, _EC2_HOURLY.get(instance_type), side)
+
+
 def _estimate_ec2(rc: ResourceChange) -> CostLine | None:
     cfg = rc.net_config
     instance_type = cfg.get("instance_type", "")
-    hourly = _EC2_HOURLY.get(instance_type)
+    hourly, pack = _ec2_hourly(instance_type, _sign(rc) or 1)
     if hourly is None:
         return CostLine(rc.address, rc.type, _action_label(rc), 0.0,
                         f"unknown instance type '{instance_type}' — skipped", "low")
     if rc.is_update:
         before_type = (rc.before or {}).get("instance_type", instance_type)
         after_type  = (rc.after  or {}).get("instance_type", instance_type)
-        before_h = _EC2_HOURLY.get(before_type, 0.0)
-        after_h  = _EC2_HOURLY.get(after_type,  0.0)
-        delta = (after_h - before_h) * HOURS_PER_MONTH
+        before_h, before_pack = _ec2_hourly(before_type, -1)
+        after_h, after_pack = _ec2_hourly(after_type, 1)
+        delta = ((after_h or 0.0) - (before_h or 0.0)) * HOURS_PER_MONTH
+        packs = ", ".join(dict.fromkeys(p for p in (before_pack, after_pack) if p))
         return CostLine(rc.address, rc.type, "change", delta,
-                        f"{before_type} → {after_type}", "high")
+                        f"{before_type} → {after_type}"
+                        + (f" (at your price book rate, {packs})" if packs else ""), "high",
+                        price_book=packs)
     monthly = hourly * HOURS_PER_MONTH * _sign(rc)
     return CostLine(rc.address, rc.type, _action_label(rc), monthly,
-                    f"{instance_type} @ ${hourly:.4f}/hr", "high")
+                    f"{instance_type} @ ${hourly:.4f}/hr"
+                    + (f" (your price book rate, {pack})" if pack else ""), "high",
+                    price_book=pack)
 
 
-def _rds_rate(cfg: dict, default_engine: str = "") -> tuple[float | None, str]:
+def _rds_rate(cfg: dict, default_engine: str = "", side: int = 1) -> tuple[float | None, str]:
     """(single-AZ hourly rate or None, engine) for one side of a plan change.
 
     The engine picks the table: RDS for PostgreSQL runs 4-7% above MySQL, and
@@ -206,9 +255,8 @@ def _rds_rate(cfg: dict, default_engine: str = "") -> tuple[float | None, str]:
     """
     class_ = cfg.get("instance_class") or ""
     engine = str(cfg.get("engine") or default_engine).strip().lower()
-    if engine:
-        return rds_hourly(class_, engine), engine
-    return _RDS_HOURLY.get(class_), engine
+    listed = rds_hourly(class_, engine) if engine else _RDS_HOURLY.get(class_)
+    return _priced(class_, listed, side)[0], engine
 
 
 def _rds_unpriced(rc: ResourceChange, action: str, what: str) -> CostLine:
@@ -220,7 +268,9 @@ def _estimate_rds(rc: ResourceChange, default_engine: str = "") -> CostLine | No
     cfg = rc.net_config
     class_ = cfg.get("instance_class", "")
     multi_az = bool(cfg.get("multi_az", False))
-    hourly, engine = _rds_rate(cfg, default_engine)
+    hourly, engine = _rds_rate(cfg, default_engine, _sign(rc) or 1)
+    book = _book_hourly(class_)
+    booked = f" (your price book rate, {book[1]})" if book else ""
     if rc.is_update:
         before = rc.before or cfg
         after = rc.after or cfg
@@ -228,13 +278,18 @@ def _estimate_rds(rc: ResourceChange, default_engine: str = "") -> CostLine | No
         after_class  = after.get("instance_class", class_)
         before_maz   = bool(before.get("multi_az", False))
         after_maz    = bool(after.get("multi_az", False))
-        bh, before_engine = _rds_rate(before, default_engine)
-        ah, after_engine = _rds_rate(after, default_engine)
+        bh, before_engine = _rds_rate(before, default_engine, -1)
+        ah, after_engine = _rds_rate(after, default_engine, 1)
         note = f"{before_class}{'×2' if before_maz else ''} → {after_class}{'×2' if after_maz else ''}"
         if bh is None or ah is None:
             return _rds_unpriced(rc, "change", f"{note} on {after_engine or before_engine or 'mysql'}")
         delta = (ah * (2 if after_maz else 1) - bh * (2 if before_maz else 1)) * HOURS_PER_MONTH
-        return CostLine(rc.address, rc.type, "change", delta, note, "high" if engine else "medium")
+        packs = ", ".join(dict.fromkeys(b[1] for b in (_book_hourly(before_class),
+                                                       _book_hourly(after_class)) if b))
+        if packs:
+            note += f" (at your price book rate, {packs})"
+        return CostLine(rc.address, rc.type, "change", delta, note,
+                        "high" if engine or packs else "medium", price_book=packs)
     if hourly is None:
         return _rds_unpriced(rc, _action_label(rc),
                              f"{class_ or 'no instance_class'} on {engine or 'mysql'}")
@@ -242,10 +297,10 @@ def _estimate_rds(rc: ResourceChange, default_engine: str = "") -> CostLine | No
         hourly *= 2
     monthly = hourly * HOURS_PER_MONTH * _sign(rc)
     az_note = " (Multi-AZ)" if multi_az else ""
-    engine_note = "" if engine else " (engine not in the plan, MySQL rate)"
+    engine_note = "" if engine or book else " (engine not in the plan, MySQL rate)"
     return CostLine(rc.address, rc.type, _action_label(rc), monthly,
-                    f"{class_}{az_note} @ ${hourly:.4f}/hr{engine_note}",
-                    "high" if engine else "medium")
+                    f"{class_}{az_note} @ ${hourly:.4f}/hr{engine_note}{booked}",
+                    "high" if engine or book else "medium", price_book=book[1] if book else "")
 
 
 def _estimate_aurora(rc: ResourceChange) -> CostLine | None:
@@ -418,6 +473,32 @@ _ESTIMATORS: dict[str, Any] = {
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _price_changes(changes: list[ResourceChange]) -> tuple[list[CostLine], list[dict]]:
+    lines: list[CostLine] = []
+    unpriced: list[dict] = []
+    for rc in changes:
+        estimator = _ESTIMATORS.get(rc.type)
+        if estimator:
+            try:
+                line = estimator(rc)
+                if line is not None:
+                    lines.append(line)
+            except Exception as exc:
+                log.debug("estimator failed for %s: %s", rc.address, exc)
+                unpriced.append({"address": rc.address, "type": rc.type})
+        else:
+            unpriced.append({"address": rc.address, "type": rc.type})
+    return lines, unpriced
+
+
+def _net(lines: list[CostLine]) -> tuple[float, float, float, float]:
+    """(adds, removes, changes, total) over priced lines."""
+    adds    = sum(l.monthly_delta for l in lines if l.action == "add"    and l.monthly_delta > 0)
+    removes = sum(l.monthly_delta for l in lines if l.action == "remove" and l.monthly_delta < 0)
+    chg     = sum(l.monthly_delta for l in lines if l.action == "change")
+    return adds, removes, chg, adds + removes + chg
+
+
 def estimate_plan(plan_data: dict) -> dict[str, Any]:
     """
     Estimate cost delta for a Terraform plan.
@@ -435,29 +516,20 @@ def estimate_plan(plan_data: dict) -> dict[str, Any]:
           "summary": str,               # human-readable 1-liner
           "unpriced": [ {address, type} ],  # resources we couldn't price
           "confidence": str,            # low / medium / high
+          "price_books": {packs, resources},  # only when a price book priced a line
+          "gate_monthly_delta_usd": float,    # only then too: see below
         }
+
+    Lines are priced at an installed price book's rate where one covers the
+    SKU, and that is the figure shown. A price book informs estimates only:
+    anything that judges the change (the guard, the cost preflight) reads
+    gate_monthly_delta_usd, the same plan priced so that a book rate can raise
+    a cost and never lower one (the higher of list and book for what is added,
+    the lower for what is removed).
     """
     changes = parse_plan(plan_data)
-    lines: list[CostLine] = []
-    unpriced: list[dict] = []
-
-    for rc in changes:
-        estimator = _ESTIMATORS.get(rc.type)
-        if estimator:
-            try:
-                line = estimator(rc)
-                if line is not None:
-                    lines.append(line)
-            except Exception as exc:
-                log.debug("estimator failed for %s: %s", rc.address, exc)
-                unpriced.append({"address": rc.address, "type": rc.type})
-        else:
-            unpriced.append({"address": rc.address, "type": rc.type})
-
-    adds    = sum(l.monthly_delta for l in lines if l.action == "add"    and l.monthly_delta > 0)
-    removes = sum(l.monthly_delta for l in lines if l.action == "remove" and l.monthly_delta < 0)
-    chg     = sum(l.monthly_delta for l in lines if l.action == "change")
-    total   = adds + removes + chg
+    lines, unpriced = _price_changes(changes)
+    adds, removes, chg, total = _net(lines)
 
     # Confidence: low if many unpriced, high if everything covered
     pct_priced = len(lines) / max(1, len(lines) + len(unpriced))
@@ -497,6 +569,20 @@ def estimate_plan(plan_data: dict) -> dict[str, Any]:
         "unpriced":   unpriced,
         "confidence": confidence,
     }
+    booked = [l for l in lines if l.price_book]
+    if booked:
+        # Priced at an installed price book's rate rather than list: which
+        # packs, and for how many resources (the guard's basis says so).
+        out["price_books"] = {
+            "packs": list(dict.fromkeys(p.strip() for l in booked
+                                        for p in l.price_book.split(","))),
+            "resources": len(booked)}
+        token = _JUDGING.set(True)
+        try:
+            judged, _ = _price_changes(changes)
+        finally:
+            _JUDGING.reset(token)
+        out["gate_monthly_delta_usd"] = round(_net(judged)[3], 2)
     if untagged:
         out["untagged_resources"] = untagged[:10]
         out["untagged_note"] = (

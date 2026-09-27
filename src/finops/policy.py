@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -150,8 +151,203 @@ def _read_policy_file() -> tuple[dict[str, Any], list[str]]:
     elif doc is not None:
         problems.append(f"{path} is a YAML {type(doc).__name__}, not a mapping of "
                         "settings, so the defaults apply")
-    _FILE_CACHE.update(key=key, keys=keys, problems=problems)
+    packs = _parse_packs_section(doc, path, readable=not problems or isinstance(doc, dict))
+    problems.extend(packs["problems"])
+    _FILE_CACHE.update(key=key, keys=keys, problems=problems, packs=packs)
     return dict(keys), list(problems)
+
+
+# ── packs: the org's rules for extension packs ───────────────────────────────
+# nable.policy.yaml may carry a `packs:` section (finops.packs reads it through
+# pack_policy()). Nothing else in this module reads it, so the keys above behave
+# exactly as before. It is read from the same place, never the working
+# directory: a repo that could ship its own pack policy could allow itself.
+#
+#   packs:
+#     allowed_sources: ["git+https://github.com/getnable/*"]   # globs over sources
+#     blocked_sources: ["io.github.someone/*"]                  # sources or pack ids
+#     require_signed: true
+#     allowed_capabilities:                                     # a ceiling
+#       read_data: [focus.cost, org.owners]
+#       network: []
+#       max_autonomy: L1
+#     registry: https://packs.example.com/index.json
+#     trusted_keys:                         # org signing keys (`nable pack keygen`)
+#       - name: acme-platform
+#         key: <base64 Ed25519 public key>
+#     allow_unsigned_code: [io.github.acme/internal-connector@<content digest>]
+#
+# Unlike the keys above, a packs section that cannot be used does not fall back
+# to "no restrictions": it fails closed. `invalid` is set and every install is
+# refused until it is fixed, because the admin who wrote a broken allowlist
+# meant to restrict something.
+
+PACK_POLICY_KEYS = ("allowed_sources", "blocked_sources", "require_signed",
+                    "allowed_capabilities", "registry", "trusted_keys",
+                    "allow_unsigned_code")
+
+
+def _pack_policy_default() -> dict[str, Any]:
+    return {"allowed_sources": None, "blocked_sources": [], "require_signed": False,
+            "allowed_capabilities": None, "registry": None, "trusted_keys": [],
+            "allow_unsigned_code": [], "invalid": False, "problems": [], "path": None}
+
+
+def _ed25519_public_key(text: Any) -> bytes | None:
+    """The 32 raw bytes of a base64 (standard or URL-safe) Ed25519 public
+    key, or None. Stdlib only: the signature itself is checked in
+    finops.packs.signing, which loads cryptography when it needs it."""
+    import base64
+    import binascii
+    if not isinstance(text, str) or not text.strip():
+        return None
+    raw = text.strip()
+    try:
+        data = base64.b64decode(raw.replace("-", "+").replace("_", "/")
+                                + "=" * (-len(raw) % 4), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    return data if len(data) == 32 else None
+
+
+def _parse_trusted_keys(val: Any, path: Path, refused: str,
+                        probs: list[str]) -> list[dict[str, str]]:
+    if not isinstance(val, list):
+        probs.append(f"{path} sets packs.trusted_keys to {val!r}, which is not a list of "
+                     f"{{name, key}} entries, {refused}")
+        return []
+    keys: list[dict[str, str]] = []
+    for i, item in enumerate(val):
+        where = f"{path} sets packs.trusted_keys[{i}]"
+        if not isinstance(item, dict) or set(item) - {"name", "key"}:
+            probs.append(f"{where} to {item!r}, which is not a mapping with name and key, "
+                         f"{refused}")
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            probs.append(f"{where}.name to {name!r}, which is not a non-empty name, {refused}")
+            continue
+        if _ed25519_public_key(item.get("key")) is None:
+            probs.append(f"{where}.key ({name}), which is not a base64 Ed25519 public key "
+                         f"(32 bytes), {refused}")
+            continue
+        keys.append({"name": name.strip(), "key": str(item["key"]).strip()})
+    return keys
+
+
+def _str_list(val: Any) -> list[str] | None:
+    if isinstance(val, list) and all(isinstance(x, str) and x.strip() for x in val):
+        return [x.strip() for x in val]
+    return None
+
+
+def _parse_packs_section(doc: Any, path: Path, *, readable: bool) -> dict[str, Any]:
+    out = _pack_policy_default()
+    out["path"] = str(path)
+    refused = "so pack installs are refused until it is fixed"
+    if not readable or (doc is not None and not isinstance(doc, dict)):
+        # The file exists and nobody can read it, and what it failed to say
+        # may have been a packs section.
+        out["invalid"] = True
+        return out
+    if not isinstance(doc, dict) or doc.get("packs") is None:
+        return out
+    sec = doc["packs"]
+    probs: list[str] = out["problems"]
+    if not isinstance(sec, dict):
+        probs.append(f"{path} sets packs: to a YAML {type(sec).__name__}, not a mapping, {refused}")
+        out["invalid"] = True
+        return out
+    for key in sec:
+        if key not in PACK_POLICY_KEYS:
+            probs.append(f"{path} sets packs.{key}, which is not one of "
+                         f"{', '.join(PACK_POLICY_KEYS)}, {refused}")
+    for key in ("allowed_sources", "blocked_sources"):
+        if key in sec:
+            vals = [] if sec[key] == [] else _str_list(sec[key])
+            if vals is None:
+                probs.append(f"{path} sets packs.{key} to {sec[key]!r}, which is not a list "
+                             f"of source patterns, {refused}")
+            else:
+                out[key] = vals
+    if "require_signed" in sec:
+        if isinstance(sec["require_signed"], bool):
+            out["require_signed"] = sec["require_signed"]
+        else:
+            probs.append(f"{path} sets packs.require_signed to {sec['require_signed']!r}, "
+                         f"which is not true or false, {refused}")
+    if "allowed_capabilities" in sec:
+        from .packs.capabilities import LIST_KEYS, SCALAR_KEYS  # light, stdlib only
+        ceil = sec["allowed_capabilities"]
+        if not isinstance(ceil, dict):
+            probs.append(f"{path} sets packs.allowed_capabilities to {ceil!r}, which is not "
+                         f"a mapping of capability to allowed values, {refused}")
+        else:
+            clean: dict[str, Any] = {}
+            for k, v in ceil.items():
+                if k in LIST_KEYS and (v == [] or _str_list(v) is not None):
+                    clean[k] = _str_list(v) or []
+                elif k in SCALAR_KEYS and isinstance(v, str):
+                    clean[k] = v.strip()
+                else:
+                    probs.append(f"{path} sets packs.allowed_capabilities.{k} to {v!r}, which "
+                                 f"is not a capability with a list (or, for guard and "
+                                 f"max_autonomy, a value), {refused}")
+            out["allowed_capabilities"] = clean
+    if "registry" in sec:
+        reg = sec["registry"]
+        if isinstance(reg, str) and reg.strip():
+            out["registry"] = reg.strip()
+        else:
+            probs.append(f"{path} sets packs.registry to {reg!r}, which is not a URL or a "
+                         f"path, {refused}")
+    if "trusted_keys" in sec and sec["trusted_keys"] is not None:
+        out["trusted_keys"] = _parse_trusted_keys(sec["trusted_keys"], path, refused, probs)
+    if "allow_unsigned_code" in sec:
+        from .packs.registry import parse_ref  # light, stdlib only
+        val = sec["allow_unsigned_code"]
+        ids = [] if val == [] else _str_list(val)
+
+        def _entry_ok(x: str) -> bool:
+            # "ns/name@<content digest>" pins the exact files; a bare id is
+            # honoured only with packs.allowed_sources (finops.packs.broker).
+            pid, sep, digest = x.partition("@")
+            return bool(parse_ref(pid)) and "@" not in pid and (
+                not sep or bool(re.fullmatch(r"[0-9a-f]{64}", digest)))
+        bad = [x for x in ids or [] if not _entry_ok(x)]
+        if ids is None or bad:
+            probs.append(f"{path} sets packs.allow_unsigned_code to {val!r}, which is not a "
+                         "list of pack ids pinned to a content digest such as "
+                         f"io.github.acme/connector@<64-hex digest>, {refused}")
+        else:
+            out["allow_unsigned_code"] = ids
+    out["invalid"] = bool(probs)
+    return out
+
+
+def pack_policy() -> dict[str, Any]:
+    """The packs: section of the policy file, validated. Keys:
+    allowed_sources (list, or None for no allowlist), blocked_sources (list),
+    require_signed (bool), allowed_capabilities (dict, or None for no
+    ceiling), registry (str or None), trusted_keys (list of {name, key}),
+    allow_unsigned_code (list of pack ids), invalid (bool: refuse every install),
+    problems, path. No policy file means no restrictions. Never raises."""
+    try:
+        policy_file_path().stat()
+    except (OSError, ValueError):
+        return _pack_policy_default()
+    try:
+        _read_policy_file()
+        packs = _FILE_CACHE.get("packs")
+    except Exception:  # noqa: BLE001 - fail closed, never break the caller
+        packs = None
+    if not isinstance(packs, dict):
+        out = _pack_policy_default()
+        out["invalid"] = True
+        return out
+    out = dict(packs)
+    out["problems"] = list(packs["problems"])
+    return out
 
 
 def _policy_file_keys() -> dict[str, Any]:

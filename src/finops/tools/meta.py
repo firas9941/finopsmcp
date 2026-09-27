@@ -732,6 +732,10 @@ def list_savings_recommendations(
                                         "Call get_recommendation_learning() for the why.")
         except Exception as exc:
             _srv.log.debug("learning rescore skipped in list_savings_recommendations: %s", exc)
+    # Who owns each one, when the org model says (team, channel, confirmed):
+    # by its tags, then its account. Never fails the listing.
+    from ..org_owner import annotate
+    annotate(out["recommendations"])
     return out
 
 
@@ -982,6 +986,21 @@ def whoami() -> dict:
         "persona": current_persona,
         "persona_label": persona_label,
     }
+
+
+@_srv.mcp.tool()
+def list_installed_packs() -> dict:
+    """
+    List the nable packs installed on this machine: each pack's version, tier,
+    what it provides (policies, guard rules, price books, skills) and the
+    capabilities it was approved with, and whether it is loaded. Read-only.
+
+    Examples:
+        - "Which nable packs are installed?"
+        - "What is the runway pack allowed to do?"
+    """
+    from ..packs import summary
+    return summary()
 
 
 @_srv.mcp.tool()

@@ -24,23 +24,33 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 
-from ..storage.db import get_engine, savings_recommendations
+from ..context.workload import classify, suppression_note
+from ..integrations.ticketing import create_github_pr
 from ..recommendations.savings_tracker import mark_acted_on
+from ..storage.db import get_engine, savings_recommendations
 from ..tagging.hcl_patcher import (
-    find_resource_file,
     apply_rightsizing_fix,
+    find_resource_file,
     generate_rightsizing_diff,
 )
 from ..tagging.tf_state import build_id_map, resolve_recommendation
-from ..context.workload import classify, suppression_note
-from ..integrations.ticketing import create_github_pr
 
 log = logging.getLogger(__name__)
+
+
+def _org_model() -> Any:
+    """The org model for the workload check, or False when it cannot be read
+    (classify then answers from the account's own signals, as before)."""
+    try:
+        from .. import org
+        return org.load()
+    except Exception as exc:  # noqa: BLE001 - the heuristics still answer
+        log.debug("org model not read for the workload check: %s", exc)
+        return False
 
 
 # ── Git helper ────────────────────────────────────────────────────────────────
@@ -240,6 +250,10 @@ def open_rightsizing_pr(
 
     recs: list[dict] = []
     skipped: list[dict] = []
+    # The org model, read at most once for every row (_org_model): an
+    # environment a human confirmed for the account decides before the
+    # classifier's heuristics.
+    org_model: Any = None
 
     for row in rows:
         rec_cfg = json.loads(row.recommended_config or "{}")
@@ -268,6 +282,14 @@ def open_rightsizing_pr(
                 # because an argument that can never be populated is the same
                 # advertised-not-wired shape in miniature.
                 resource_name=getattr(row, "resource_name", "") or "",
+                # The account id is not a name to scan, but it is what an
+                # org model environment fact is about.
+                account_id=getattr(row, "account_id", "") or None,
+                provider=getattr(row, "provider", "") or "aws",
+                org=org_model if org_model is not None else (org_model := _org_model()),
+                # Holding a pull request back is the careful side here: a
+                # guess never releases one, and a disagreement holds it.
+                safe="nonprod",
             )
             if ctx.is_nonprod:
                 skipped.append({

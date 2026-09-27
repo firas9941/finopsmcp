@@ -1,6 +1,6 @@
 # nable
 
-**See where your cloud and AI bills go, and spend less. Runs in your terminal or inside Claude, Cursor, and VS Code.**
+**nable prices what your coding agents are about to do, before they do it. Free, local, one command.**
 
 [![PyPI](https://img.shields.io/pypi/v/finops-mcp?label=pypi&color=4db8d4)](https://pypi.org/project/finops-mcp/)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/finops-mcp?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/finops-mcp)
@@ -8,17 +8,41 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-4db8d4)](LICENSE)
 [![MCP Toplist](https://mcptoplist.com/badge/io.github.getnable%2Ffinops-mcp.svg)](https://mcptoplist.com/server/io.github.getnable%2Ffinops-mcp)
 
-**nable is an open-source, local-first FinOps MCP server for cloud and AI cost.** It covers AWS, Azure, GCP, Kubernetes, and 15+ AI and SaaS providers, and runs from your terminal or inside Claude, Cursor, and VS Code.
+nable puts a check in front of the commands a coding agent is about to run, in Claude Code, Cursor, Codex CLI, GitHub Copilot, Gemini CLI and Cline (and in front of MCP tool calls in the first three). A launch is priced at list price before it runs, a one-way door (destroy, terminate, a commitment purchase) stops for a human, and every verdict goes to a hash-chained ledger on your machine. The guard needs no cloud account, no API key and no license.
 
-You do not need to be a cloud-cost expert. nable does three things:
-
-- **Shows what you spend** across AWS, Azure, GCP, Kubernetes, and 15+ AI and SaaS providers, in one place.
-- **Finds what you are wasting** (idle servers, oversized databases, forgotten storage) and puts a dollar figure on each one.
-- **Fixes it, with your approval,** by opening a pull request, then checks your next bill to prove the saving was real.
-
-Everything runs on your machine, read-only, and your billing data never leaves it.
+nable is also an open-source (Apache-2.0), local-first FinOps tool for cloud and AI cost: a read-only scan that finds waste in your AWS account using only free APIs, AI coding-agent spend priced per model with per-session caps, and AI cost split by project, team and user. It runs in your terminal or as an MCP server inside Claude, Cursor and VS Code, and your billing data never leaves your machine.
 
 ## Try it
+
+```bash
+uvx nable guard install      # Claude Code, this project. --all: every agent found. --global: every project.
+uvx nable guard try          # see it first: four sample commands through the gate, nothing executed
+```
+
+What the agent gets back when it tries a costly launch or a destroy (real output, no cloud account needed):
+
+```text
+$ uvx nable guard check --command "aws ec2 run-instances --instance-type p4d.24xlarge --count 8"
+  ask  nable guard: 8x p4d.24xlarge at $21.9576/hr (on-demand us-east-1 list price) is ~$128,233/mo. The +$128,233/mo impact is over your $500 auto threshold; a human should review it. Budget not checked: there is no spend figure on this machine yet; `nable budget refresh` computes one.
+
+$ uvx nable guard check --command "terraform destroy -auto-approve"
+  ask  nable guard: This would destroy infrastructure (`terraform destroy -auto-approve`). It cannot be undone; confirm to proceed.
+```
+
+Using the Claude Code plugin? Installing it turns the guard on, no second step:
+
+```text
+/plugin marketplace add getnable/finopsmcp
+/plugin install nable@nable
+```
+
+`nable guard off` (or `FINOPS_GUARD=off`) pauses every nable hook and `nable guard on` resumes it; an agent that tries `nable guard off` itself is asked about first.
+
+In Claude Code, Cursor and Copilot CLI, `ask` stops the agent until you confirm; Codex CLI, Gemini CLI, Cline and Copilot's cloud agent refuse the command and show the reason (per-agent table under "Guard hook" below). A launch under the threshold stays silent: a `t3.micro` is ~$8/mo, under the default $500/mo (`FINOPS_POLICY_MAX_AUTO_USD`). Restart the agent after installing so it picks up the hook.
+
+What needs a cloud account: pricing and asking do not. The budget stop, `nable guard reconcile` (CloudTrail) and the scan below read your own account, read-only.
+
+## Scan what is already running
 
 ```bash
 uvx nable scan
@@ -38,7 +62,14 @@ $2,140/mo recoverable
 run `nable scan --spend` for the spend breakdown (uses Cost Explorer, ~$0.02)
 ```
 
-Reads only free cloud APIs, so scanning never adds to your bill. `uvx nable scan --demo` runs on sample data with no account at all. Add `--json` for CI, or `--spend` for a deeper breakdown.
+Uses the AWS credentials already on your machine and reads only free cloud APIs, so scanning never adds to your bill. `uvx nable scan --demo` runs on sample data with no account at all. Add `--json` for CI, or `--spend` for a deeper breakdown.
+
+From there nable:
+
+- **Shows what you spend** across AWS, Azure, GCP, Kubernetes, and 15+ AI and SaaS providers, in one place.
+- **Finds what you are wasting** (idle servers, oversized databases, forgotten storage) and puts a dollar figure on each one.
+- **Fixes it, with your approval,** by opening a pull request, then checks your next bill to prove the saving was real.
+- **Budgets your AI agents:** `nable ai-budget` prices Claude Code and Codex CLI usage per model from local logs, with a per-session cap; `nable ai-costs --by project|team|user` splits OpenAI, Anthropic, LiteLLM and Langfuse spend.
 
 ![nable demo: a sample bill in seconds](https://raw.githubusercontent.com/getnable/finopsmcp/main/docs/demo.gif)
 
@@ -60,16 +91,18 @@ Reads only free cloud APIs, so scanning never adds to your bill. `uvx nable scan
 | Clouds covered | AWS, Azure, GCP, Kubernetes | AWS only | Multi-cloud | IaC, any cloud |
 | AI and GPU spend | Yes (OpenAI, Anthropic, Bedrock, GPUs) | Bedrock only | Vantage: yes; CloudHealth: token dashboard | No |
 | Runs in Claude / Cursor / VS Code | Yes (local MCP) | Billing MCP server (read-only) | Vantage: hosted MCP; CloudHealth: no | Yes (MCP, editor extensions) |
-| Checks an agent's command for cost and policy before it runs | Yes (guard hook) | No | No | No |
+| Prices an agent's command before it runs | Yes: a hook in Claude Code, Cursor, Codex CLI, Copilot, Gemini CLI and Cline prices launches, stops one-way doors, and logs every verdict | No | No | No (prices IaC diffs at pull-request time) |
 | Fixes waste | Opens a pull request, you approve | No | Vantage: in-product agent; no PR to your IaC | AutoFix PRs before deploy, not on running waste |
-| Answers | What you spend and waste now | AWS spend | Multi-cloud spend | Cost of an IaC change before deploy |
-| Price | Free (local) | Free tier, then per request | Paid SaaS | Free (OSS), paid cloud |
+| Answers | What an agent is about to spend; what you spend and waste now | AWS spend | Multi-cloud spend | Cost of an IaC change before deploy |
+| Price | Free (local); paid plans are flat, never a percentage of spend | Free tier, then per request | Paid SaaS | Free (OSS), paid cloud |
 
-Infracost prices an infrastructure change before you deploy it; nable finds and fixes waste in what you are already running. Fuller breakdowns: [nable vs Vantage](https://getnable.com/nable-vs-vantage), [vs CloudHealth](https://getnable.com/nable-vs-cloudhealth), [vs Kubecost](https://getnable.com/nable-vs-kubecost).
+Infracost prices an infrastructure change in the pull request; nable's guard prices the command an agent is about to run, wherever it came from, and the scan finds waste in what is already running. Fuller breakdowns: [nable vs Vantage](https://getnable.com/nable-vs-vantage), [vs CloudHealth](https://getnable.com/nable-vs-cloudhealth), [vs Kubecost](https://getnable.com/nable-vs-kubecost).
 
 ## Agent guard
 
-`nable guard install` adds a hook to Claude Code (and `--all` to Cursor and Codex) that checks each infrastructure command or MCP call before it runs: a one-way door (destroy, terminate, a commitment) asks you first, and a launch is priced at list price so a $191k/mo `run-instances` asks instead of passing. It also watches the pattern across calls: a velocity cap on the monthly run-rate let through per hour (`FINOPS_POLICY_VELOCITY_CAP_USD`, default four times the $500/mo per-action threshold) and loop detection for the same creation repeated (three identical `create-stack` in ten minutes asks). Every verdict goes to a local hash-chained ledger.
+`nable guard install` adds a hook to Claude Code (and `--all` to every supported agent it finds: Cursor, Codex CLI, GitHub Copilot, Gemini CLI, Cline) that checks each infrastructure command, or MCP call in Claude Code, Cursor and Codex, before it runs: a one-way door (destroy, terminate, a commitment) asks you first, and a launch is priced at list price so a ~$128k/mo `run-instances` (8x p4d.24xlarge) asks instead of passing. It also watches the pattern across calls: a velocity cap on the monthly run-rate let through per hour (`FINOPS_POLICY_VELOCITY_CAP_USD`, default four times the $500/mo per-action threshold) and loop detection for the same creation repeated (three identical `create-stack` in ten minutes asks). Every verdict goes to a local hash-chained ledger.
+
+**AI budgets that stay current.** When a Claude Code, Codex or Cursor spend cap is set, the guard weighs each call against it. Cursor usage comes from its Admin API (`CURSOR_ADMIN_API_KEY`): the hook never waits on the network, and when its copy is over an hour old it refreshes it in the background and says so (`FINOPS_GUARD_BACKGROUND_REFRESH=0` turns that off). `FINOPS_GUARD_AUTO_REFRESH_BUDGET=1` does the same for the cloud-budget figure, recomputing it from local cost history with no billed calls.
 
 **Stops tied to the budget.** A priced change is also checked against the cloud budgets you set (the `set_budget` tool or a `budget.yml`): when month-to-date spend plus the change's cost for the rest of the month would take a budget over its limit, the guard asks, naming the budget, the spend so far, the change's monthly figure and the projected overage. `on_budget_breach: deny` in `nable.policy.yaml` (in nable's data directory, `~/.finops` by default, or at `FINOPS_POLICY_FILE`) makes that a hard stop; `FINOPS_GUARD_STOP_ON_BUDGET=1` or `=0` overrides it for one session or CI run. Total, provider and service budgets apply from the command itself; team and account budgets apply when `FINOPS_GUARD_TEAM` or `FINOPS_GUARD_ACCOUNT` names them where the agent runs. The hook reads a small spend summary rather than the database: every budget check writes it, `nable budget refresh` is the one to schedule, and a figure older than 48 hours (`FINOPS_GUARD_BUDGET_MAX_AGE_HOURS`) or from last month is not used, which the verdict on a priced change says. `nable guard doctor` lists the budgets the guard enforces, the ones it cannot place a change in, and the age of its figure.
 
@@ -84,6 +117,34 @@ nable budget ci-gate --fail-on-breach --json   # a pipeline step that fails on a
 `ci-gate` reports and exits 0 unless `--fail-on-breach` is passed; with it, a breached budget (spend at or past its critical percentage) exits 1 and a check that cannot run exits 2. `--budget-file budget.yml` syncs the file first.
 
 `reconcile` needs `cloudtrail:LookupEvents` (free, read-only) and matches by kind and time, since the ledger holds no resource ids. The guard is a seatbelt, not a security boundary: `nable guard doctor` lists what it does not see.
+
+**It guards its own settings.** An agent that writes, moves or deletes the files that decide what the guard does (the org model, `nable.policy.yaml`, installed packs, the ledger, the off switch, the hook entries in each agent's settings) is asked about first, from the shell in every agent and through Claude Code's Write and Edit tools too. So are `nable guard off`, `nable org confirm` and `nable pack install` run by an agent, from any entry point (`nable`, `finops`, `finops-mcp`, `uvx`, `python -m`).
+
+## Molded to your org
+
+`nable org init` reads what your org already says about itself (CODEOWNERS, Terraform, AWS Organizations, tags, account and namespace names) and proposes who owns what, which environments are which, and which tag keys mean team or cost center. It then asks at most ten questions, highest spend first, most of them in bulk ("payments owns these 8 things, $18,500/mo: yes, no or edit"). Answers are stored as plain YAML in a `nable.org/` folder you own: in your repo if you want it reviewed by pull request (`nable org init --here`), otherwise in nable's data directory.
+
+```bash
+nable org init            # propose, then ask the week-one questions
+nable org status          # what is confirmed, proposed, stale or in conflict, and spend coverage
+nable org questions       # the open questions, with the command that answers each
+nable org export --format json
+```
+
+What a person confirms changes what nable does: guard asks name the owner ("Owned by payments (#payments-oncall)"), the guard takes the team for team budgets and per-team thresholds from the repo you work in, tickets carry the owner's team and channel, findings carry an owner, and attribution and prod or non-prod detection use your confirmed facts before any guess. Agents, adapters and the MCP tools can only propose; confirming takes a person at the CLI or a merged pull request. A guess may make nable more careful, never less. A `nable.org/` that arrives inside a cloned repo is read on top of your own model, and until you `nable org trust` it, its owners are shown as likely and its thresholds may only lower yours.
+
+## Packs
+
+Packs extend nable with an org's own rules: policies, guard rules that can only tighten, remediation playbooks, price books, report templates, coding-agent skills, and (sandboxed) connectors, org adapters and ticket or Slack sinks. Each declares what it may read, which secrets it gets and which hosts it may reach in `nable-pack.toml`; you see that at install, and an update that asks for more waits for your approval again.
+
+```bash
+nable pack install ./my-pack          # a folder, a .tar.gz, git+https://...@<commit>, or ns/name from the registry
+nable pack audit                      # what is installed, what each may do, and whether any file changed
+nable pack validate ./my-pack         # for authors
+```
+
+Your org policy file can limit where packs come from, cap what they may ask for, and require signatures (`packs:` in `nable.policy.yaml`). Details, the capability list and the honest limits of sandboxing on a laptop are in [docs/PACKS.md](docs/PACKS.md).
+
 
 ## Setup
 

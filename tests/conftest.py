@@ -48,6 +48,46 @@ def _guard_ledger_sandbox(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _guard_switch_sandbox(monkeypatch, tmp_path_factory):
+    """The guard's off switch (`nable guard off`, FINOPS_GUARD=off) and the
+    Claude Code plugin's enabled state are read from the machine: nable's data
+    directory and Claude Code's user settings. A developer who paused the
+    guard, or has the nable plugin installed, must not change what the suite
+    sees, so both point at empty throwaway directories. Tests of those lookups
+    reset the overrides themselves."""
+    import finops.guard_plugin as gp
+    monkeypatch.delenv("FINOPS_GUARD", raising=False)
+    monkeypatch.setattr(gp, "_data_root_override", tmp_path_factory.mktemp("finops-data"))
+    monkeypatch.setattr(gp, "_user_dir_override", tmp_path_factory.mktemp("claude-user"))
+
+
+@pytest.fixture(autouse=True)
+def _org_model_sandbox(monkeypatch, tmp_path_factory):
+    """The guard, tickets, findings, attribution and the workload classifier
+    read the org model (finops.org), which lives in the developer's data dir
+    or a repo's nable.org/. A developer with one must not change what the
+    suite sees, so FINOPS_ORG_DIR points at an empty directory. Tests of the
+    org model set or clear it themselves."""
+    monkeypatch.setenv("FINOPS_ORG_DIR", str(tmp_path_factory.mktemp("org-model")))
+
+
+@pytest.fixture(autouse=True)
+def _packs_sandbox(monkeypatch, tmp_path_factory):
+    """The guard reads installed packs (guard rules, price books) on every
+    verdict. A developer with packs installed must not change what the suite
+    sees, so the packs root is an empty directory; the packs tests point it
+    elsewhere themselves (tests/packs_support.py)."""
+    from finops import guard_packs
+    from finops.packs import runtime, store
+    monkeypatch.setattr(store, "_root_override", tmp_path_factory.mktemp("packs") / "packs")
+    runtime.invalidate()
+    guard_packs.invalidate()
+    yield
+    runtime.invalidate()
+    guard_packs.invalidate()
+
+
+@pytest.fixture(autouse=True)
 def _no_ambient_service_creds(monkeypatch):
     """Unit tests must not inherit the developer's live service credentials.
 
@@ -67,9 +107,13 @@ def _no_ambient_agent_usage(monkeypatch, tmp_path_factory):
     rollouts under CODEX_HOME, and Cursor's Admin API when a key is set. A dev
     box with a real ~/.codex, a Codex session id in its environment, or a
     Cursor key must not leak its usage (or a network call) into a unit test.
-    Tests that exercise those readers set their own values on top."""
+    Tests that exercise those readers set their own values on top. The guard's
+    background refresh (background_refresh) is off under pytest unless a test
+    turns it on, so a developer's own setting is cleared too."""
     monkeypatch.setenv("CODEX_HOME", str(tmp_path_factory.mktemp("codex-home")))
-    for var in ("CODEX_SESSION_ID", "CURSOR_ADMIN_API_KEY", "CURSOR_ADMIN_USER_EMAIL"):
+    for var in ("CODEX_SESSION_ID", "CURSOR_ADMIN_API_KEY", "CURSOR_ADMIN_USER_EMAIL",
+                "FINOPS_CURSOR_API_URL", "FINOPS_GUARD_BACKGROUND_REFRESH",
+                "FINOPS_GUARD_AUTO_REFRESH_BUDGET"):
         monkeypatch.delenv(var, raising=False)
 
 

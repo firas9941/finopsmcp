@@ -33,6 +33,16 @@ either way. Spend comes from the summary the budget checks write
 last month) is not used, and a verdict on a priced change says the budget went
 unchecked.
 
+The org model (finops.org, read by guard_org.py only for a priced change or
+an ask or deny): an ask or a deny on a priced change or a one-way door names
+the owner of what the command touches ("Owned by payments
+(#payments-oncall).", "Likely owned by ..." for a proposal); with
+FINOPS_GUARD_TEAM unset, the confirmed owner of the working directory's repo
+path is the team whose budgets apply; and a confirmed threshold for that team
+or for an environment the command touches replaces the auto threshold and
+the velocity cap. Any error there is a recorded fail-open (check "org") and
+the call is judged as if there were no org model.
+
 History (the recent end of the decision ledger, guard_ledger.recent) can
 turn an allow or a warn into an ask, never anything else:
   velocity cap   the priced monthly run-rate the guard let through in a
@@ -49,6 +59,20 @@ exits 0 so a guard bug can never break the user's agent. It answers before
 it records (answer_first), waits at most 200 ms on the ledger's lock, and
 asks rather than judges a command over 256 KB, so neither the ledger file
 nor a padded command can run it past the harness timeout.
+
+The guard's own files (guard_paths: the org model, the policy file, the
+installed packs, the off flag, the ledger, the budgets, the settings that
+carry the hook): a shell command, an MCP call or one of Claude Code's file
+tools (Write, Edit, MultiEdit, NotebookEdit) that writes to one asks, and so
+does `nable pack install|update|remove|sign|keygen`. An agent could
+otherwise loosen its own guard without a command the rules above would see.
+
+Installed packs (guard_packs): their guard rules may tighten any verdict
+(silence or an allow to an ask, an ask to a deny), never loosen one, and
+their price books inform the figures shown for the SKUs they name ("at your
+price book rate"): the verdict judges at the higher of the list price and the
+book rate, so a price book can never make a launch look cheaper to the
+guard. A pack the guard cannot load is a recorded fail-open.
 
 Strict mode (FINOPS_GUARD_STRICT=1) additionally asks on reversible
 mutations (terraform apply, helm upgrade, kubectl apply/scale,
@@ -362,11 +386,13 @@ _SHELL_LEX_RE = re.compile(
 # confirm a destroy nobody was running, and a guard that cries wolf on every
 # docs commit gets uninstalled. `bash -c`, `sh -c` and `eval` are not here:
 # their quoted argument is a command.
-_DATA_PROGRAM_RE = re.compile(r"(?:echo|printf|grep|rg|ag|git)(?![\w.-])")
+_DATA_PROGRAM_RE = re.compile(r"(?:echo|printf|grep|rg|ag|git|gh)(?![\w.-])")
 _DATA_SEGMENT_RE = re.compile(
     r"\s*(?:(?:[A-Za-z_]\w*=\S*|sudo|command|time|nohup)\s+)*(?:\S*/)?"
     r"(?:(?:echo|printf|grep|egrep|fgrep|rg|ag)(?!\S)"
-    r"|git(?:\s+-\S+(?:\s+[^\s-]\S*)?)*?\s+(?:commit|tag)(?!\S))")
+    r"|git(?:\s+-\S+(?:\s+[^\s-]\S*)?)*?\s+(?:commit|tag)(?!\S)"
+    # A pull request's or an issue's title, body or comment.
+    r"|gh\s+(?:pr|issue)\s+(?:create|edit|comment|review|close)(?!\S))")
 # Blanking is for commands short enough to check this carefully (and to hand
 # to shlex); a longer one is judged as written.
 _MASK_MAX_CHARS = 16 * 1024
@@ -412,8 +438,8 @@ def _plain_ok(cmd: str, a: int, b: int) -> bool:
 
 def _quoted_data_args(cmd: str) -> list[tuple[int, int]]:
     """Spans (quotes included) of the quoted arguments of echo, printf, grep,
-    rg, ag and `git commit|tag` that the shell will not run, or [] when that
-    is not certain for the whole command.
+    rg, ag, `git commit|tag` and `gh pr|issue create|...` that the shell will
+    not run, or [] when that is not certain for the whole command.
 
     Conservative on purpose: a comment, an escape, a subshell, a redirection
     into a file, a pipe into anything but a reader, an unterminated quote or
@@ -575,6 +601,24 @@ def _fast(pattern: str) -> re.Pattern[str]:
                   else f"{guard[:-1]}{word})")      # (?<!X) -> (?<!Xword)
         pattern = f"{word}{behind}{pattern[m.end():]}"
     return re.compile(pattern)
+
+
+class _Lazy:
+    """A pattern compiled the first time it is used. The hook imports this
+    module on every Bash and MCP call; the patterns only some calls need (an
+    MCP tool's name, a long one-liner, a substitution) cost nothing until
+    one of those comes."""
+
+    __slots__ = ("_args", "_re")
+
+    def __init__(self, pattern: str, flags: int = 0) -> None:
+        self._args = (pattern, flags)
+        self._re: re.Pattern[str] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._re is None:
+            self._re = re.compile(*self._args)
+        return getattr(self._re, name)
 
 
 class _Rule:
@@ -845,25 +889,90 @@ def _hours_per_month() -> float:
     return HOURS_PER_MONTH
 
 
+# An installed price book (a pack's price_books, finops.packs.price_override)
+# holds the org's own rate for a SKU: an EDP discount, a private offer, a
+# markup. A price book informs the figure shown and never loosens a verdict:
+# thresholds, the velocity cap and budgets judge at the higher of the list
+# price and the book rate (_gated). A book rate above list prices at it and
+# says so ("at your price book rate"); one below list is shown beside the
+# list figure the guard judges by. A book that prices a SKU the tables do not
+# know is used as it is (without it there would be no figure at all). The
+# ledger records which pack's rate it was. With none installed, or none for
+# this SKU, pricing is the list price as before. Read through guard_packs,
+# which caches the packs between hooks.
+
+def _gated(provider: str, sku: str | None, list_rate: float | None, per: str = "hour"
+           ) -> tuple[float | None, dict[str, Any] | None, bool]:
+    """(the rate the guard judges by, the price book entry or None, whether
+    that rate is the book's). A book rate of 0 is a rate, not "no price"."""
+    book = _book(provider, sku, per)
+    if book is None:
+        return list_rate, None, False
+    if list_rate is None or book["usd"] >= list_rate:
+        return book["usd"], book, True
+    return list_rate, book, False
+
+
+def _below_list(book: dict[str, Any], units: float, per: str = "hr") -> str:
+    """What a book rate below list would make the figure, said beside it."""
+    return (f"; at your price book rate of {_rate(book['usd'])}/{per} ({book['pack']}) "
+            f"it would be ~${book['usd'] * units:,.0f}/mo, but a price book can only raise "
+            "the figure the guard judges by, so its threshold and budget checks use the "
+            "list price")
+
+
+def _book(provider: str, sku: str | None, per: str = "hour") -> dict[str, Any] | None:
+    """The org's USD rate for `sku` from an installed price book, or None."""
+    if not sku:
+        return None
+    try:
+        from .guard_packs import rate
+        return rate(provider, sku, per=per)
+    except Exception:
+        return None                    # list price, as with no price book
+
+
+def _book_basis(basis: str, book: dict[str, Any], list_basis: str = _ON_DEMAND_BASIS) -> str:
+    """`basis` with the list price it names replaced by the price book's rate."""
+    return basis.replace(list_basis, f"on-demand rate in your price book ({book['pack']})")
+
+
+def _book_field(book: dict[str, Any], judged: bool = True,
+                book_monthly: float | None = None) -> dict[str, Any]:
+    out = {"pack": book["pack"], "sku": book["sku"], "rate": book["rate"],
+           "unit": book["unit"]}
+    if not judged:
+        # Below list: shown, not used for the verdict.
+        out.update(below_list=True, monthly_usd=round(book_monthly or 0.0, 2))
+    return out
+
+
 def _price_ec2(itype: str | None, count: int, *, basis: str = _ON_DEMAND_BASIS,
                lead: str = "") -> dict[str, Any] | None:
-    """`count` instances of `itype` at the EC2 table's rate, or None."""
+    """`count` instances of `itype` at the EC2 table's rate (or the org's
+    price book rate for it), or None."""
     if not itype:
         return None
     from .aws_prices import EC2_HOURLY
-    hourly = EC2_HOURLY.get(itype)
-    if not hourly:
+    hourly, book, judged = _gated("aws", itype, EC2_HOURLY.get(itype))
+    if hourly is None:
         return None
+    if book and judged:
+        basis = _book_basis(basis, book)
     count = max(count, 1)
-    monthly = hourly * count * _hours_per_month()
+    hours = count * _hours_per_month()
+    monthly = hourly * hours
+    at = "at your price book rate of " if judged else "at "
     return {
         "monthly_usd": round(monthly, 2),
         "hourly_usd": hourly,
         "instance_type": itype,
         "count": count,
         "basis": basis,
-        "line": (f"{lead}{count}x {itype} at {_rate(hourly)}/hr ({basis}) "
-                 f"is ~${monthly:,.0f}/mo"),
+        **({"price_book": _book_field(book, judged, book["usd"] * hours)} if book else {}),
+        "line": (f"{lead}{count}x {itype} {at}{_rate(hourly)}/hr ({basis}) "
+                 f"is ~${monthly:,.0f}/mo"
+                 + (_below_list(book, hours) if book and not judged else "")),
     }
 
 
@@ -942,26 +1051,36 @@ def _price_nodegroup(cmd: str, **_: Any) -> dict[str, Any] | None:
 def _price_rds(cmd: str, **_: Any) -> dict[str, Any] | None:
     cls = _flag(cmd, "db-instance-class")
     engine = (_flag(cmd, "engine") or "").lower()
-    if not cls or engine not in _RDS_TABLE_ENGINES:
+    if not cls:
         return None
+    # A price book's rate for the class stands for whatever engine the org
+    # priced it on, so it also prices an engine the list tables do not hold.
     from .aws_prices import rds_hourly
-    hourly = rds_hourly(cls, engine)
-    if not hourly:
+    listed = rds_hourly(cls, engine) if engine in _RDS_TABLE_ENGINES else None
+    hourly, book, judged = _gated("aws", cls, listed)
+    if hourly is None:
         return None
     # Multi-AZ runs a standby of the same class: twice the instance hours,
     # the same rule the Terraform estimator applies to aws_db_instance.
     multi_az = _has_flag(cmd, "multi-az")
-    monthly = hourly * (2 if multi_az else 1) * _hours_per_month()
+    hours = (2 if multi_az else 1) * _hours_per_month()
+    monthly = hourly * hours
     basis = f"{_ON_DEMAND_BASIS}, instance hours only; storage and I/O not included"
+    if book and judged:
+        basis = _book_basis(basis, book)
+    at = "at your price book rate of " if judged else "at "
     return {
         "monthly_usd": round(monthly, 2),
         "hourly_usd": hourly,
         "instance_type": cls,
         "count": 2 if multi_az else 1,
         "basis": basis,
-        "line": (f"{cls} {engine}{' Multi-AZ' if multi_az else ''} at {_rate(hourly)}/hr"
+        **({"price_book": _book_field(book, judged, book["usd"] * hours)} if book else {}),
+        "line": (f"{cls} {engine or 'RDS'}{' Multi-AZ' if multi_az else ''} {at}"
+                 f"{_rate(hourly)}/hr"
                  f"{' x2 for the standby' if multi_az else ''} ({basis}) "
-                 f"is ~${monthly:,.0f}/mo"),
+                 f"is ~${monthly:,.0f}/mo"
+                 + (_below_list(book, hours) if book and not judged else "")),
     }
 
 
@@ -974,27 +1093,36 @@ def _price_rds_class_change(cmd: str, **_: Any) -> dict[str, Any] | None:
     cls = _flag(cmd, "db-instance-class")
     if not cls:
         return None
+    multi_az = _has_flag(cmd, "multi-az")
     from .aws_prices import rds_hourly
     rates = {"PostgreSQL": rds_hourly(cls, "postgres") or 0.0,
              "MySQL/MariaDB": rds_hourly(cls, "mysql") or 0.0}
-    engine, hourly = max(rates.items(), key=lambda kv: kv[1])
-    if not hourly:
-        return None
+    engine, listed = max(rates.items(), key=lambda kv: kv[1])
     if len(set(rates.values())) == 1:
         engine = "MySQL, MariaDB and PostgreSQL alike"
-    multi_az = _has_flag(cmd, "multi-az")
-    monthly = hourly * (2 if multi_az else 1) * _hours_per_month()
-    basis = (f"{_ON_DEMAND_BASIS}, the {engine} rate (the engine is not in the command), "
-             "instance hours only, before subtracting the current class")
+    hourly, book, judged = _gated("aws", cls, listed or None)
+    if hourly is None:
+        return None
+    if judged:
+        basis = _book_basis(f"{_ON_DEMAND_BASIS}, instance hours only, before subtracting "
+                            "the current class", book)
+    else:
+        basis = (f"{_ON_DEMAND_BASIS}, the {engine} rate (the engine is not in the command), "
+                 "instance hours only, before subtracting the current class")
+    hours = (2 if multi_az else 1) * _hours_per_month()
+    monthly = hourly * hours
+    at = "at your price book rate of " if judged else "at "
     return {
         "monthly_usd": round(monthly, 2),
         "hourly_usd": hourly,
         "instance_type": cls,
         "count": 2 if multi_az else 1,
         "basis": basis,
-        "line": (f"resized to {cls}{' Multi-AZ' if multi_az else ''} at {_rate(hourly)}/hr"
+        **({"price_book": _book_field(book, judged, book["usd"] * hours)} if book else {}),
+        "line": (f"resized to {cls}{' Multi-AZ' if multi_az else ''} {at}{_rate(hourly)}/hr"
                  f"{' x2 for the standby' if multi_az else ''} ({basis}) "
-                 f"is ~${monthly:,.0f}/mo"),
+                 f"is ~${monthly:,.0f}/mo"
+                 + (_below_list(book, hours) if book and not judged else "")),
     }
 
 
@@ -1054,21 +1182,35 @@ def _leading_names(cmd: str, verb_end: int) -> int:
 
 
 def _price_table_vm(cmd: str, *, flag: str, table: dict[str, float], count: int,
-                    basis: str) -> dict[str, Any] | None:
+                    basis: str, provider: str) -> dict[str, Any] | None:
     size = _flag(cmd, flag)
     if not size:
         return None
     # Azure sizes are case-insensitive on the CLI (standard_d4s_v3 works).
-    each = table.get(size) or {k.lower(): v for k, v in table.items()}.get(size.lower())
-    if not each:
+    listed = table.get(size)
+    if listed is None:
+        listed = {k.lower(): v for k, v in table.items()}.get(size.lower())
+    each, book, judged = _gated(provider, size, listed, per="month")
+    if each is None:
         return None
+    if judged:
+        basis = f"monthly rate in your price book ({book['pack']})"
     monthly = each * count
+    at = "at your price book rate of " if judged else "at "
+    below = ""
+    if book and not judged:
+        below = (f"; at your price book rate of ${book['usd']:,.2f}/mo each ({book['pack']}) "
+                 f"it would be ~${book['usd'] * count:,.0f}/mo, but a price book can only "
+                 "raise the figure the guard judges by, so its threshold and budget checks "
+                 "use the list price")
     return {
         "monthly_usd": round(monthly, 2),
         "instance_type": size,
         "count": count,
         "basis": basis,
-        "line": f"{count}x {size} at ${each:,.2f}/mo each ({basis}) is ~${monthly:,.0f}/mo",
+        **({"price_book": _book_field(book, judged, book["usd"] * count)} if book else {}),
+        "line": (f"{count}x {size} {at}${each:,.2f}/mo each ({basis}) is ~${monthly:,.0f}/mo"
+                 + below),
     }
 
 
@@ -1077,7 +1219,7 @@ def _price_gce(cmd: str, **_: Any) -> dict[str, Any] | None:
     m = _GCE_CREATE_RE.search(cmd)
     return _price_table_vm(
         cmd, flag="machine-type", table=_GKE_MONTHLY,
-        count=max(1, _leading_names(cmd, m.end())),
+        count=max(1, _leading_names(cmd, m.end())), provider="gcp",
         basis="on-demand monthly, nable's Compute Engine node price table")
 
 
@@ -1085,7 +1227,7 @@ def _price_az_vm(cmd: str, **_: Any) -> dict[str, Any] | None:
     from .connectors.kubernetes import _AKS_MONTHLY
     return _price_table_vm(
         cmd, flag="size", table=_AKS_MONTHLY,
-        count=int(_num(_flag(cmd, "count")) or 1),
+        count=int(_num(_flag(cmd, "count")) or 1), provider="azure",
         basis="pay-as-you-go monthly, nable's Azure VM price table")
 
 
@@ -1271,9 +1413,18 @@ def _price_planfile(cmd: str, *, cwd: str | None = None, whole: str | None = Non
     result = estimate_plan(doc)
     if not result["lines"]:
         return None                    # nothing in the plan is priceable
-    monthly = float(result["monthly_delta_usd"])
+    # A price book may raise the figure judged, never lower it (_gated).
+    shown = float(result["monthly_delta_usd"])
+    monthly = float(result.get("gate_monthly_delta_usd", shown))
     unpriced = len(result["unpriced"])
-    basis = (f"`{tool} show -json {plan}`, {_ON_DEMAND_BASIS}"
+    books = result.get("price_books") or {}
+    booked = (f"; {books['resources']} resource{'s' if books['resources'] != 1 else ''} "
+              f"at your price book rate ({', '.join(books['packs'])})" if books else "")
+    if books and round(shown, 2) != round(monthly, 2):
+        booked += (f", which would make it {'+' if shown >= 0 else '-'}${abs(shown):,.0f}/mo; "
+                   "a price book can only raise the figure the guard judges by, so the "
+                   "list price stands where it is higher")
+    basis = (f"`{tool} show -json {plan}`, {_ON_DEMAND_BASIS}{booked}"
              + (f"; {unpriced} resource{'s' if unpriced != 1 else ''} in the plan not priced"
                 if unpriced else ""))
     return {
@@ -1282,6 +1433,7 @@ def _price_planfile(cmd: str, *, cwd: str | None = None, whole: str | None = Non
         "priced_resources": len(result["lines"]),
         "unpriced_resources": unpriced,
         "basis": basis,
+        **({"price_book": {"pack": ", ".join(books["packs"])}} if books else {}),
         "line": (f"{plan} changes the bill by {'+' if monthly >= 0 else '-'}"
                  f"${abs(monthly):,.0f}/mo ({basis})"),
     }
@@ -1393,6 +1545,10 @@ def _added_up(parts: list[dict[str, Any]], unpriced: int) -> dict[str, Any] | No
                             + " plus ".join(said))}
             if one_off:
                 est["total_usd"] = round(sum(one_off), 2)
+            books = list(dict.fromkeys(p["price_book"]["pack"] for p in parts
+                                       if p.get("price_book")))
+            if books:
+                est["price_book"] = {"pack": ", ".join(books)}
     if unpriced:
         est = {**est, "unpriced_changes": unpriced,
                "line": (f"{est['line']} ({unpriced} more change"
@@ -1504,12 +1660,14 @@ def check_budget_gate(session_id: str | None = None) -> dict[str, Any] | None:
     the more severe of the two verdicts answers (_against_budget).
 
     Which calls that is, exactly: in Claude Code, the Bash tool and every MCP
-    tool (the installed matcher is ^(Bash|mcp__.*)$), known to the guard or
-    not; in Cursor and Codex, shell commands. NOT Claude Code's built-in Edit,
-    Write, Read, Glob, Grep, WebFetch, WebSearch or Task tools: widening the
-    matcher to them would add the hook's start-up time to every file edit, so
-    an agent over budget can still edit files until its next shell or MCP
-    call. `nable guard doctor` says the same.
+    tool (the installed matcher is _HOOK_MATCHER), known to the guard or not;
+    in Cursor and Codex, shell commands. NOT Claude Code's built-in Edit,
+    Write, Read, Glob, Grep, WebFetch, WebSearch or Task tools. The file tools
+    do reach the hook, but only to check for an edit to the guard's own files
+    (guard_paths); guard_plugin answers every other edit before the guard is
+    imported, so reading the budget there would add its cost to every file
+    edit. An agent over budget can still edit files until its next shell or
+    MCP call. `nable guard doctor` says the same.
 
     Reads the local Claude Code session logs (ai_budget), so it needs no cloud
     account, no API key and no network. Returns None when no budget is set, when
@@ -1542,6 +1700,12 @@ def check_budget_gate(session_id: str | None = None) -> dict[str, Any] | None:
             detail = (f"{st.get('billable_tokens_mtd', 0):,} tokens this month, "
                       f"{over} your {budget.get('monthly_tokens', 0):,} budget")
             raise_it = "nable ai-budget --tokens N"
+        # What the figure leaves out or is late on (Cursor usage not read, or
+        # read a while ago), said with it.
+        lens = (st.get("session") if st.get("verdict_basis") == "session"
+                else st.get("month_to_date")) or {}
+        for note in lens.get("source_notes") or []:
+            detail += f". {note.rstrip('.')}"
         if verdict == BUDGET_WARN:
             # Close to the line: say so, alongside, without stopping anything.
             return {
@@ -1656,11 +1820,14 @@ _PRICER_SCOPE: dict[Any, tuple[str | None, str | None]] = {
 _BUDGETS_LISTED = 5
 
 
-def _change_scope(command: str) -> dict[str, str | tuple[str, ...]]:
+def _change_scope(command: str, *, team: str | None = None
+                  ) -> dict[str, str | tuple[str, ...]]:
     """What the guard knows about where a change bills: provider and service
     from each shell command in it (a tuple when they differ), team and
     account from FINOPS_GUARD_TEAM and FINOPS_GUARD_ACCOUNT (a command does
-    not say which team it is for).
+    not say which team it is for). `team`, when given, is the team the org
+    model scopes the working directory to (_OrgLens.team), and stands in for
+    an unset FINOPS_GUARD_TEAM.
 
     A budget scoped to one of several services a command bills to is checked
     against the whole command's figure: more than lands in it, which is the
@@ -1687,6 +1854,8 @@ def _change_scope(command: str) -> dict[str, str | tuple[str, ...]]:
         val = os.getenv(env, "").strip()
         if val:
             scope[key] = val
+    if team and "team" not in scope:
+        scope["team"] = team
     return scope
 
 
@@ -1706,8 +1875,21 @@ def _budget_scope_words(b: dict[str, Any]) -> str:
     return "total" if kind == "total" else f"{kind} {b.get('scope_value')}"
 
 
+def _refresh_budget_summary(doc: dict[str, Any] | None, state: str) -> bool:
+    """With FINOPS_GUARD_AUTO_REFRESH_BUDGET=1, have a stale or absent spend
+    summary recomputed in the background (background_refresh), for the next
+    priced change. Not when the summary lists no budget: nothing to check.
+    True when a refresh is under way."""
+    if state not in ("stale", "absent") or (doc is not None and not doc.get("budgets")):
+        return False
+    from . import background_refresh
+    if not background_refresh.budget_auto_enabled():
+        return False
+    return background_refresh.maybe_start(background_refresh.BUDGET) is not None
+
+
 def budget_lens(command: str, est: dict[str, Any] | None, *,
-                now: Any = None) -> dict[str, Any] | None:
+                now: Any = None, team: str | None = None) -> dict[str, Any] | None:
     """The change against the budget figures on this machine, or None when the
     change is not priced or does not add cost.
 
@@ -1720,7 +1902,9 @@ def budget_lens(command: str, est: dict[str, Any] | None, *,
       stale      the figures are older than the limit (or from last month)
       absent     there are no figures on this machine
     It is also what the ledger records. Never raises: a summary it cannot read
-    is "absent".
+    is "absent". A stale or absent one carries "refreshing" when a background
+    refresh is under way (_refresh_budget_summary). `team` is the org model's
+    team scope when FINOPS_GUARD_TEAM is unset (_change_scope).
     """
     if not est:
         return None
@@ -1741,10 +1925,12 @@ def budget_lens(command: str, est: dict[str, Any] | None, *,
             out["max_age_hours"] = fresh["max_age_hours"]
             if fresh["previous_month"]:
                 out["previous_month"] = True
+        if _refresh_budget_summary(doc, fresh["state"]):
+            out["refreshing"] = True
         return out
     when["spend_through"] = fresh["spend_through"]
     today = datetime.now().astimezone().date()
-    scope = _change_scope(command)
+    scope = _change_scope(command, team=team)
     checked: list[str] = []
     over: list[dict[str, Any]] = []
     for b in _summary.current_budgets(doc or {}, today=today):
@@ -1817,6 +2003,16 @@ def _budget_policy() -> dict[str, Any]:
     return {**pol, "on_budget_breach": "deny" if hard else "ask"}
 
 
+def _scoped_policy(org: Any, over: bool) -> dict[str, Any] | None:
+    """The policy a priced change is gated with: the budget policy when it
+    is over a budget, with the org model's thresholds for its team and
+    environment when a human confirmed any (_OrgLens.policy). None means the
+    gate's own default, exactly as before the org model."""
+    base = _budget_policy() if over else None
+    scoped = org.policy(base or load_policy())
+    return scoped if scoped is not None else base
+
+
 def _on_breach() -> tuple[str, str]:
     """(what a change over budget gets, which setting says so)."""
     env = os.getenv("FINOPS_GUARD_STOP_ON_BUDGET", "").strip().lower()
@@ -1832,23 +2028,27 @@ def _on_breach() -> tuple[str, str]:
     return str(load_policy().get("on_budget_breach") or "ask"), source
 
 
-def budget_status() -> dict[str, Any]:
+def budget_status(org_team: str | None = None) -> dict[str, Any]:
     """Which cloud budgets the guard checks priced changes against, and how
     fresh its spend figure is: the doctor's view of budget_lens.
 
     enforced      budgets in the current period a change can land in: total,
                   provider and service ones (placed by the command), team and
                   account ones when FINOPS_GUARD_TEAM / FINOPS_GUARD_ACCOUNT
-                  name them
+                  name them, or the org model scopes this directory to the
+                  team (org_status)
     not_enforced  team and account budgets nothing places a change in
     state         "fresh", "stale", "no_data" or "absent" (budget.summary.freshness)
     on_breach     "ask" or "deny", and on_breach_source, the setting behind it
+
+    `org_team` is the team the org model scopes this directory to, which a
+    priced change here is checked as when FINOPS_GUARD_TEAM is unset.
     """
     from .budget import summary as _summary
     doc = _summary.read_summary()
     fresh = _summary.freshness(doc)
     on_breach, source = _on_breach()
-    env = {"team": os.getenv("FINOPS_GUARD_TEAM", "").strip(),
+    env = {"team": os.getenv("FINOPS_GUARD_TEAM", "").strip() or (org_team or ""),
            "account": os.getenv("FINOPS_GUARD_ACCOUNT", "").strip()}
     enforced: list[dict[str, Any]] = []
     not_enforced: list[dict[str, Any]] = []
@@ -1870,6 +2070,44 @@ def budget_status() -> dict[str, Any]:
             "max_age_hours": fresh["max_age_hours"], "enforced": enforced,
             "not_enforced": not_enforced, "on_breach": on_breach,
             "on_breach_source": source, "summary_path": str(_summary.summary_path())}
+
+
+def org_status(cwd: str | None = None) -> dict[str, Any]:
+    """The doctor's view of the org model (finops.org): whether one is
+    loaded, where from, how many facts are confirmed and proposed, and the
+    team the guard scopes priced changes in `cwd` to. Never raises.
+
+    loaded       True when the org directory holds an org file or any fact applies
+                 (legacy ones from tag_rules.yaml or accounts.yaml included)
+    team         FINOPS_GUARD_TEAM, else the confirmed owner of this repo
+                 path; team_source says which
+    thresholds   the confirmed per-scope thresholds for that team, if any
+    """
+    out: dict[str, Any] = {"loaded": False}
+    try:
+        from . import guard_org
+        from .org.model import KNOWN_FILES
+        m = guard_org.load_model(cwd or os.getcwd())
+        counts = m.status_counts()
+        files = m.dir.is_dir() and any((m.dir / n).is_file() for n in KNOWN_FILES)
+        out.update(loaded=bool(files or m.facts), dir=str(m.dir),
+                   dir_source=m.dir_source, exists=m.dir.is_dir(),
+                   confirmed=counts["confirmed"], proposed=counts["proposed"],
+                   legacy=sum(1 for f in m.facts if f.origin == "legacy"),
+                   warnings=len(m.warnings))
+        env_team = os.getenv("FINOPS_GUARD_TEAM", "").strip()
+        team, source = ((env_team, "FINOPS_GUARD_TEAM") if env_team
+                        else guard_org.team_scope(m, cwd))
+        out.update(team=team, team_source=source)
+        # What the guard would apply: confirmed only, and a repo that is not
+        # trusted may only lower a figure (guard_org.thresholds), never the
+        # raw file contents.
+        t = guard_org.thresholds(m, team, [])
+        if t:
+            out["thresholds"] = t
+    except Exception as exc:  # noqa: BLE001 - the doctor reports it, never dies of it
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 
 def _budget_reason(lens: dict[str, Any], *, hard: bool, why: str, undo: str = "") -> str:
@@ -1910,16 +2148,18 @@ def _budget_skip_note(lens: dict[str, Any] | None) -> str | None:
     """What a verdict on a priced change says when the budget went unchecked."""
     if not lens:
         return None
+    fix = ("it is being refreshed in the background" if lens.get("refreshing")
+           else "`nable budget refresh` updates it")
     if lens["state"] == "stale" and lens.get("previous_month"):
-        return ("Budget not checked: nable's spend figure is from last month; "
-                "`nable budget refresh` updates it.")
+        return f"Budget not checked: nable's spend figure is from last month; {fix}."
     if lens["state"] == "stale":
         return (f"Budget not checked: nable's spend figure is {_summary_age(lens)} old "
                 f"(the guard uses figures up to {lens.get('max_age_hours', 48):g} hours "
-                "old); `nable budget refresh` updates it.")
+                f"old); {fix}.")
     if lens["state"] == "absent":
         return ("Budget not checked: there is no spend figure on this machine yet; "
-                "`nable budget refresh` computes one.")
+                + ("one is being computed in the background." if lens.get("refreshing")
+                   else "`nable budget refresh` computes one."))
     if lens["state"] == "no_data":
         return ("Budget not checked: nable has no cost data for this budget period yet; "
                 "sync cost data, then `nable budget refresh`.")
@@ -1932,16 +2172,157 @@ def _budget_skip_note(lens: dict[str, Any] | None) -> str | None:
 _WARN_AT = 0.80
 
 
+class _OrgLens:
+    """One verdict's view of the org model (guard_org): the team scope, the
+    per-scope thresholds and the owner of what the command touches, each
+    computed at most once and only when asked, so an ordinary command never
+    imports finops.org.
+
+    Never raises. The first error switches the lens off and is kept in
+    `error`; _verdict_for then judges the call again with the lens off (the
+    guard as it was before the org model) and records the fail-open."""
+
+    def __init__(self, command: str, cwd: str | None, *, on: bool = True) -> None:
+        self.command, self.cwd, self.on = command, cwd, on
+        self.error: BaseException | None = None
+        self._memo: dict[str, Any] = {}
+
+    def _get(self, name: str, fn: Any, default: Any) -> Any:
+        if not self.on:
+            return default
+        if name not in self._memo:
+            try:
+                self._memo[name] = fn()
+            except Exception as exc:  # noqa: BLE001 - kept, judged again, recorded
+                self.error, self.on = exc, False
+                return default
+        return self._memo[name]
+
+    def _model(self) -> Any:
+        from . import guard_org
+        return self._get("model", lambda: guard_org.load_model(self.cwd), None)
+
+    def _subjects(self) -> list[str]:
+        from . import guard_org
+        m = self._model()
+        return self._get("subjects", lambda: guard_org.subjects(self.command, self.cwd, m)
+                         if m is not None else [], [])
+
+    def team(self) -> tuple[str | None, str | None]:
+        """(team, where it came from): FINOPS_GUARD_TEAM when set, else the
+        confirmed owner of the working directory's repo path."""
+        env = os.getenv("FINOPS_GUARD_TEAM", "").strip()
+        if env:
+            return env, "FINOPS_GUARD_TEAM"
+
+        def find() -> tuple[str | None, str | None]:
+            from . import guard_org
+            m = self._model()
+            return guard_org.team_scope(m, self.cwd) if m is not None else (None, None)
+        return self._get("team", find, (None, None))
+
+    def thresholds(self) -> dict[str, Any]:
+        """Confirmed per-scope thresholds for the team and the environments
+        the command touches, or {}."""
+        def find() -> dict[str, Any]:
+            from . import guard_org
+            m = self._model()
+            if m is None or not any(f.confirmed for f in m.by_kind("threshold")):
+                return {}
+            return guard_org.thresholds(m, self.team()[0],
+                                        guard_org.confirmed_envs(m, self._subjects()))
+        return self._get("thresholds", find, {})
+
+    def policy(self, base: dict[str, Any]) -> dict[str, Any] | None:
+        """`base` with the org model's thresholds in it, or None when the org
+        model sets none (the caller keeps its own policy)."""
+        t = self.thresholds()
+        if not t:
+            return None
+        pol = dict(base)
+        if "max_auto_monthly_usd" in t:
+            pol["max_auto_monthly_usd"] = t["max_auto_monthly_usd"]
+        if "velocity_cap_usd" in t:
+            pol["velocity_cap_monthly_usd"] = t["velocity_cap_usd"]
+        return pol
+
+    def whose(self, name: str) -> str:
+        """"for team payments (in /repo/nable.org/policy.yaml)": the scope
+        whose confirmed threshold set `name` ("max_auto_monthly_usd" or
+        "velocity_cap_usd") and the file it is in, or ""."""
+        t = self.thresholds()
+        if not t:
+            return ""
+        from . import guard_org
+        # Name the file when the figure came from a repo's nable.org/, so a
+        # person can see a repo set it; the user's own org dir goes unnamed.
+        where = (t.get("files") or {}).get(name) or ""
+        if "nable.org" not in Path(where).parts:
+            t = {**t, "files": {}}
+        return guard_org.whose(t, name)
+
+    def owner(self) -> Any:
+        def find() -> Any:
+            from . import guard_org
+            m = self._model()
+            return guard_org.owner(m, self._subjects()) if m is not None else None
+        return self._get("owner", find, None)
+
+
 def _verdict_for(command: str, hit: tuple[str, str], *, context: str | None = None,
                  via: str = "", cwd: str | None = None) -> dict[str, Any]:
-    """The policy verdict, then what the ledger's recent history adds to it.
+    """The policy verdict, then what the ledger's recent history adds to it,
+    then the owner of what it touches when it asks or denies.
 
     A history check that fails leaves the policy verdict standing and puts the
     exception under "_history_error" for the caller to record as a fail-open:
-    a guard that cannot read its own ledger must not take a position."""
-    v = _policy_verdict(command, hit, context=context, via=via, cwd=cwd)
+    a guard that cannot read its own ledger must not take a position. An org
+    model that fails the same way puts it under "_org_error", and the call is
+    judged again as if there were no org model."""
+    org = _OrgLens(command, cwd)
+    v = _judged(command, hit, context=context, via=via, cwd=cwd, org=org)
+    if org.error is not None:
+        err = org.error
+        v = _judged(command, hit, context=context, via=via, cwd=cwd,
+                    org=_OrgLens(command, cwd, on=False))
+        return {**v, "_org_error": err}
+    v = _with_owner(v, org)
+    if org.error is not None:
+        v = {**v, "_org_error": org.error}
+    elif org.on and org._memo.get("thresholds"):
+        # The org model's thresholds were in force for this verdict: the
+        # ledger keeps which figures, from which scope and which file.
+        v = {**v, "org_thresholds": org._memo["thresholds"]}
+    return v
+
+
+def _with_owner(v: dict[str, Any], org: _OrgLens) -> dict[str, Any]:
+    """An ask or a deny on a priced change or a one-way door names who owns
+    what it touches, when the org model says: "Owned by payments
+    (#payments-oncall).", or "Likely owned by ..." for a proposal. A citation
+    changes no decision, so an unconfirmed owner may be shown, marked."""
+    if v.get("decision") not in ("ask", "deny") or not v.get("reason"):
+        return v
+    if v.get("door") != "one_way" and not v.get("estimate"):
+        return v
+    r = org.owner()
+    if r is None:
+        return v
     try:
-        v = _check_history(v, command, via=via, cwd=cwd)
+        from . import guard_org
+        return {**v, "reason": f"{v['reason']} {guard_org.owner_words(r)}",
+                "owner": guard_org.owner_field(r)}
+    except Exception as exc:  # noqa: BLE001 - a citation never costs the verdict
+        org.error = exc
+        return v
+
+
+def _judged(command: str, hit: tuple[str, str], *, context: str | None, via: str,
+            cwd: str | None, org: _OrgLens) -> dict[str, Any]:
+    """_verdict_for without the owner: policy, history, the budget note."""
+    v = _policy_verdict(command, hit, context=context, via=via, cwd=cwd, org=org)
+    try:
+        v = _check_history(v, command, via=via, cwd=cwd, org=org)
     except Exception as exc:
         v = {**v, "_history_error": exc}
     # A priced change whose budget went unchecked says so, whenever the
@@ -1954,7 +2335,8 @@ def _verdict_for(command: str, hit: tuple[str, str], *, context: str | None = No
 
 
 def _policy_verdict(command: str, hit: tuple[str, str], *, context: str | None = None,
-                    via: str = "", cwd: str | None = None) -> dict[str, Any]:
+                    via: str = "", cwd: str | None = None,
+                    org: _OrgLens | None = None) -> dict[str, Any]:
     """The policy verdict for one already-classified action. Always a dict:
     "allow" is a verdict too (the ledger records it, with its figure), and the
     public entry points turn it into None for their callers.
@@ -1963,10 +2345,13 @@ def _policy_verdict(command: str, hit: tuple[str, str], *, context: str | None =
     whichever door the agent used. `command` is the shell form, which is what
     gets priced; `context` is the text searched for a production context
     (defaults to the command); `via` prefixes the reason with what an MCP call
-    amounts to, since the human never saw a command.
+    amounts to, since the human never saw a command. `org` is the org
+    model's view (team scope, per-scope thresholds); None judges without it.
     """
     door, action_type = hit
     lead = f"{via}. " if via else ""
+    if org is None:
+        org = _OrgLens(command, cwd, on=False)
 
     lens: dict[str, Any] | None = None
 
@@ -2013,13 +2398,20 @@ def _policy_verdict(command: str, hit: tuple[str, str], *, context: str | None =
         # And through the budget: what is left of it this month, not only the
         # per-action threshold (budget_lens).
         est = estimate_command_monthly_cost(command, cwd=cwd)
-        lens = budget_lens(command, est)
+        lens = budget_lens(command, est, team=org.team()[0] if est is not None else None)
         if est is not None:
             over = lens is not None and lens["state"] == "over"
             gate = evaluate_action_gate(action_type,
                                         monthly_delta_usd=est.get("monthly_usd") or 0.0,
                                         cost_verdict="over_budget" if over else None,
-                                        policy=_budget_policy() if over else None)
+                                        policy=_scoped_policy(org, over))
+            whose = org.whose("max_auto_monthly_usd")
+            if gate.get("rule") == "threshold" and whose:
+                # Say whose threshold it is when it is not the policy's own.
+                gate = {**gate, "reason": re.sub(
+                    r"your (\$[\d,]+) auto threshold",
+                    lambda m: f"the {m.group(1)} auto threshold {whose} (org model)",
+                    str(gate.get("reason") or ""), count=1)}
             if gate.get("gate") != GATE_ALLOW:
                 if gate.get("rule") == "over_budget" and lens is not None:
                     hard, why, undo = _budget_hard_stop()
@@ -2046,18 +2438,21 @@ def _policy_verdict(command: str, hit: tuple[str, str], *, context: str | None =
             # Allowed, but close to the line: say so without stopping anyone.
             # "warn" never changes the permission flow; the hook shows the
             # figure and the call proceeds exactly as an allow would.
-            cap = float(load_policy().get("max_auto_monthly_usd", 500.0))
+            pol = org.policy(load_policy()) or load_policy()
+            cap = float(pol.get("max_auto_monthly_usd", 500.0))
             monthly = est.get("monthly_usd") or 0.0
+            whose = org.whose("max_auto_monthly_usd")
             if cap > 0 and monthly >= _WARN_AT * cap:
-                return verdict("warn", f"{_cost_line(est)}, {monthly / cap:.0%} of your "
-                               f"${cap:,.0f}/mo auto threshold. Proceeding without a prompt.",
-                               est=est)
+                line = (f"the ${cap:,.0f}/mo auto threshold {whose} (org model)" if whose
+                        else f"your ${cap:,.0f}/mo auto threshold")
+                return verdict("warn", f"{_cost_line(est)}, {monthly / cap:.0%} of {line}. "
+                               "Proceeding without a prompt.", est=est)
         return allowed(est)
 
     # One-way doors escalate whatever they cost, but the human deciding on a
     # Savings Plan should see the commitment in the same breath as the question.
     est = estimate_command_monthly_cost(command, cwd=cwd)
-    lens = budget_lens(command, est)
+    lens = budget_lens(command, est, team=org.team()[0] if est is not None else None)
     over = lens is not None and lens["state"] == "over"
     cost = f"{_cost_line(est)}. " if est else ""
     if destroys:
@@ -2067,7 +2462,8 @@ def _policy_verdict(command: str, hit: tuple[str, str], *, context: str | None =
     gate = evaluate_action_gate(action_type,
                                 monthly_delta_usd=(est or {}).get("monthly_usd") or 0.0,
                                 cost_verdict="over_budget" if over else None,
-                                policy=_budget_policy() if over else None)
+                                policy=(_scoped_policy(org, over) if est is not None
+                                        else _budget_policy() if over else None))
     if over and gate.get("rule") != "allowlist":
         # A commitment that breaks the budget: the budget sentence travels with
         # whatever else the gate said, and a hard stop makes it a deny.
@@ -2187,10 +2583,11 @@ _HISTORY_LISTED = 5
 
 
 def _check_history(v: dict[str, Any], command: str, *, via: str = "",
-                   cwd: str | None = None) -> dict[str, Any]:
+                   cwd: str | None = None, org: _OrgLens | None = None) -> dict[str, Any]:
     """`v` upgraded to an ask when recent history says so, else `v` unchanged
     apart from its loop key. May raise; _verdict_for turns that into a
-    fail-open."""
+    fail-open. The velocity cap is the org model's for this team or
+    environment when a human confirmed one (`org`)."""
     if v.get("action_type") == "infra_apply":
         key = loop_key(command, cwd=cwd)
         if key is not None:
@@ -2199,6 +2596,13 @@ def _check_history(v: dict[str, Any], command: str, *, via: str = "",
         return v
     pol = load_policy()
     new = (v.get("estimate") or {}).get("monthly_usd")
+    whose = ""
+    if org is not None and isinstance(new, (int, float)) and new > 0:
+        scoped = org.policy(pol)
+        if scoped is not None and velocity_cap(scoped) != velocity_cap(pol):
+            whose = (org.whose("velocity_cap_usd")
+                     or org.whose("max_auto_monthly_usd"))
+            pol = scoped
     cap = velocity_cap(pol)
     vel_window = float(pol.get("velocity_window_minutes") or 0.0)
     velocity_on = isinstance(new, (int, float)) and new > 0 and cap > 0 and vel_window > 0
@@ -2218,7 +2622,7 @@ def _check_history(v: dict[str, Any], command: str, *, via: str = "",
     if velocity_on:
         since = _minutes_ago(vel_window)
         why = _velocity_reason(v, [r for r in recent if str(r.get("ts", "")) >= since],
-                               new=float(new), cap=cap, window=vel_window)
+                               new=float(new), cap=cap, window=vel_window, whose=whose)
         if why:
             found.append(("velocity", why))
     if not found:
@@ -2401,9 +2805,10 @@ def _listed(recs: list[dict[str, Any]]) -> str:
 
 
 def _velocity_reason(v: dict[str, Any], recent: list[dict[str, Any]], *, new: float,
-                     cap: float, window: float) -> str | None:
+                     cap: float, window: float, whose: str = "") -> str | None:
     """The velocity cap: priced monthly run-rate let through in the window,
-    plus this action, over the cap."""
+    plus this action, over the cap. `whose` names the org model scope that
+    set the cap ("for team payments"), when one did."""
     counted = [r for r in recent
                if r.get("decision") in _LET_THROUGH
                and isinstance(r.get("monthly_usd"), (int, float)) and r["monthly_usd"] > 0]
@@ -2416,6 +2821,9 @@ def _velocity_reason(v: dict[str, Any], recent: list[dict[str, Any]], *, new: fl
             f"last {window:g} minutes ({n} action{'s' if n != 1 else ''}: {_listed(counted)}), "
             f"that is ~{_usd(total + new)}/mo in {window:g} minutes"
             if counted else f"{_cost_line(est)}, on its own")
+    if whose:
+        return (f"{head}, over the {_usd(cap)}/mo velocity cap per {window:g} minutes "
+                f"{whose} (org model). Confirm to proceed.")
     return (f"{head}, over your {_usd(cap)}/mo velocity cap per {window:g} minutes. "
             "Confirm to proceed, or raise FINOPS_POLICY_VELOCITY_CAP_USD.")
 
@@ -2468,21 +2876,34 @@ def gate_command(command: str, session_id: str | None = None, *, harness: str = 
         v: dict[str, Any] | None
         if len(command) > MAX_JUDGED_CHARS:
             v = _oversize_verdict(command)
+            forms: tuple[str, ...] = (command,)
         else:
-            v = _self_change(command)
-            if v is None:
-                hit = classify_command(command)
-                v = _verdict_for(command, hit, cwd=cwd) if hit is not None else None
+            v = _self_change(command) or _protected_write(command, cwd) or _oversize_code(command)
+            hit = classify_command(command)
+            if hit is not None:
+                v = _worse_of(v, _verdict_for(command, hit, cwd=cwd))
+            forms = ()
+        # Installed guard-rule packs may tighten any of that, never loosen it.
+        v, pack_error, pack_problem = _with_packs(
+            v, forms=forms, commands=() if forms else (command,))
+        if record:
+            _record_pack_trouble(pack_error, pack_problem, judged=v is not None or stop is not None,
+                                 harness=harness, tool=tool, command=command,
+                                 session_id=session_id)
         if v is None and stop is None:
             # Not an infra command: nothing to record, but a budget note
             # still shows (unrecorded; it is not a decision about this call).
             return {**note, "harness": harness} if note else None
         history_error = v.pop("_history_error", None) if v is not None else None
+        org_error = v.pop("_org_error", None) if v is not None else None
         answer, recorded = _against_budget(v, stop)
         if record:
             if history_error is not None:
                 _record_fail_open(history_error, harness=harness, tool=tool, command=command,
                                   check="history", session_id=session_id)
+            if org_error is not None:
+                _record_fail_open(org_error, harness=harness, tool=tool, command=command,
+                                  check="org", session_id=session_id)
             if stop is not None:
                 _record({**stop, "harness": harness}, tool=tool, command=command,
                         session_id=session_id)
@@ -2499,6 +2920,143 @@ def gate_command(command: str, session_id: str | None = None, *, harness: str = 
 
 
 _SEVERITY = {"deny": 3, "ask": 2, "warn": 1, "allow": 0}
+
+
+def _worse_of(change: dict[str, Any] | None, judged: dict[str, Any]) -> dict[str, Any]:
+    """A command that both changes the guard (a self rule, a protected write)
+    and is an infrastructure change (`rm ~/.finops/guard-off && terraform
+    destroy`): the more severe verdict answers, with both reasons, so
+    confirming the one is never a way past the other. On a tie the change's
+    verdict answers, carrying the infrastructure verdict's reason when that
+    one asks or denies too."""
+    if change is None:
+        return judged
+    if _SEVERITY[judged["decision"]] > _SEVERITY[change["decision"]]:
+        return _with_reason_of(judged, change)
+    if judged["decision"] in ("ask", "deny"):
+        return _with_reason_of(change, judged)
+    return change
+
+
+class _PackRuleHit(NamedTuple):
+    rule: str
+    pack: str
+    verdict: str
+    reason: str
+
+
+def _pack_command_results(base: str, rules: Any, tighten: Any, command: str) -> list[Any]:
+    """tighten() over the readings of one command line. The reading with
+    quoted data blanked counts as it is; a rule that only the others (as
+    written, aliases expanded, nothing blanked) match counts unless all it
+    matches is inside one quoted data argument (_only_in_data): a commit
+    message or a search pattern that names a command is not that command."""
+    r = _readings(command)
+    out = [tighten(base, rules, command=r.masked)]
+    for rule in rules:
+        if rule.matches_command(r.masked):
+            continue
+
+        def judge(form: str, rule: Any = rule) -> str | None:
+            return rule.id if rule.matches_command(form) else None
+        for form in dict.fromkeys((r.expanded, r.raw, command)):
+            if judge(form) is not None and not _only_in_data(r, rule.id, judge):
+                out.append(tighten(base, [rule], command=form))
+                break
+    return out
+
+
+def _with_packs(v: dict[str, Any] | None, *, forms: Any = (), commands: Any = (),
+                tool: str | None = None, args: Any = None
+                ) -> tuple[dict[str, Any] | None, BaseException | None, BaseException | None]:
+    """(v after the installed packs' guard rules, an error reading them, a
+    pack with guard rules or a price book that is not loaded).
+
+    finops.packs.content.tighten() over every reading of each of `commands`
+    (_pack_command_results), over each of `forms` as it is (a command too
+    long to read), and over the MCP call: the strictest answer wins, and it
+    is never looser than `v`. A rule that matches without tightening is
+    named in the ledger only. An error keeps `v` as it was: the caller
+    records it as a fail-open (check "packs")."""
+    try:
+        from . import guard_packs
+        st = guard_packs.state()
+        problem = guard_packs.PackLoadProblem() if st["guard_problems"] else None
+        rules = st["rules"]
+        if not rules:
+            return v, None, problem
+        from .packs.rules import VERDICT_ORDER, tighten
+        base = (v or {}).get("decision", "allow")
+        if base not in VERDICT_ORDER:
+            return v, None, problem
+        hits: dict[tuple[str, str], _PackRuleHit] = {}
+        worst = base
+        results = [tighten(base, rules, command=f) for f in forms]
+        for c in commands:
+            results += _pack_command_results(base, rules, tighten, c)
+        if tool is not None:
+            results.append(tighten(base, rules, tool=tool, args=args))
+        for t in results:
+            if VERDICT_ORDER.index(t["verdict"]) > VERDICT_ORDER.index(worst):
+                worst = t["verdict"]
+            for h in t["rules"]:
+                hits.setdefault((h["pack"], h["id"]),
+                                _PackRuleHit(h["id"], h["pack"], h["verdict"], h["reason"]))
+    except Exception as exc:
+        return v, exc, None
+    if not hits:
+        return v, None, problem
+    named = [f"{h.pack}:{h.rule}" for h in hits.values()]
+    if worst == base:
+        return ({**v, "pack_rules": named} if v is not None else v), None, problem
+    said = " ".join(f"{h.reason.rstrip('. ')} (rule {h.rule} of pack {h.pack})."
+                    for h in hits.values() if h.verdict == worst)
+    closing = ("It was stopped by an installed pack; do not run it."
+               if worst == "deny" else "Confirm to proceed.")
+    if v is None or base in ("allow", "warn"):
+        # The pack's reason leads: the guard's own view of the call was an allow.
+        reason = f"nable guard: {said} {closing}"
+        if v is not None and v.get("reason"):
+            reason = f"{reason} {v['reason'].removeprefix('nable guard: ')}"
+        out = {**(v or {"action_type": "pack_rule", "door": None}), "decision": worst,
+               "reason": reason}
+    else:
+        out = {**v, "decision": worst,
+               "reason": f"{v['reason']} {said} {closing if worst == 'deny' else ''}".rstrip()}
+    out["pack_rules"] = named
+    return out, None, problem
+
+
+# A pack the guard cannot load is judged without, and that is a fail-open;
+# recorded with every call the guard records anyway, and otherwise at most
+# once in this many minutes, so a broken pack cannot fill the ledger.
+_PACK_TROUBLE_EVERY_MIN = 10
+
+
+def _record_pack_trouble(error: BaseException | None, problem: BaseException | None, *,
+                         judged: bool, harness: str, tool: Any, command: Any,
+                         session_id: Any) -> None:
+    if error is not None:
+        _record_fail_open(error, harness=harness, tool=tool, command=command, check="packs",
+                          session_id=session_id)
+    elif problem is not None and (judged or _pack_trouble_due()):
+        _record_fail_open(problem, harness=harness, tool=tool, command=command, check="packs",
+                          session_id=session_id)
+
+
+def _pack_trouble_due() -> bool:
+    import time
+
+    from . import guard_ledger
+    path = guard_ledger.ledger_path().with_name("guard-packs-note")
+    try:
+        if time.time() - path.stat().st_mtime < _PACK_TROUBLE_EVERY_MIN * 60:
+            return False
+    except OSError:
+        pass
+    with contextlib.suppress(OSError):
+        path.write_text("The guard recorded that an installed pack could not be loaded.\n")
+    return True
 
 
 def _with_reason_of(primary: dict[str, Any], other: dict[str, Any]) -> dict[str, Any]:
@@ -2590,10 +3148,11 @@ def gate_mcp_call(tool_name: str, arguments: dict[str, Any] | None, *,
         budget_hit = check_budget_gate(session_id)
         note = budget_hit if budget_hit and budget_hit["decision"] == "warn" else None
         stop = budget_hit if note is None else None
-        change = _budget_change(tool_name, arguments)
-        actions = [] if change is not None else translate(tool_name, arguments)
-        if not actions and stop is None and change is None:
-            return {**note, "harness": harness, "mcp_tool": tool_name} if note else None
+        change = _budget_change(tool_name, arguments) or _protected_mcp(tool_name, arguments)
+        # A write to the guard's own files is judged with whatever else the
+        # call does, so confirming the one is never a way past the other.
+        judge_actions = change is None or change.get("action_type") in _JUDGED_WITH
+        actions = translate(tool_name, arguments) if judge_actions else []
         if actions:
             summary = actions[0].command
 
@@ -2601,7 +3160,7 @@ def gate_mcp_call(tool_name: str, arguments: dict[str, Any] | None, *,
         if change is not None:
             summary = change.pop("summary")
             worst = change
-        else:
+        if judge_actions:
             context = argument_text(arguments)
             for act in actions:
                 if len(act.command) > MAX_JUDGED_CHARS:
@@ -2610,7 +3169,9 @@ def gate_mcp_call(tool_name: str, arguments: dict[str, Any] | None, *,
                 if act.unchecked:
                     v = _unchecked_verdict(tool_name, act.unchecked)
                 else:
-                    v = _self_change(act.command)
+                    # A self rule on a command line in the arguments is the
+                    # change already found; the command is judged for the rest.
+                    v = _self_change(act.command) if change is None else None
                     if v is None:
                         hit = act.hit or classify_command(act.command)
                         if hit is None:
@@ -2623,8 +3184,24 @@ def gate_mcp_call(tool_name: str, arguments: dict[str, Any] | None, *,
                     _record_fail_open(history_error, harness=harness, tool=tool_name,
                                       command=act.command, check="history",
                                       session_id=session_id)
-                if worst is None or _SEVERITY[v["decision"]] > _SEVERITY[worst["decision"]]:
+                org_error = v.pop("_org_error", None)
+                if org_error is not None and record:
+                    _record_fail_open(org_error, harness=harness, tool=tool_name,
+                                      command=act.command, check="org",
+                                      session_id=session_id)
+                if worst is not None and worst.get("action_type") in _JUDGED_WITH:
+                    worst = _worse_of(worst, v)
+                elif worst is None or _SEVERITY[v["decision"]] > _SEVERITY[worst["decision"]]:
                     worst, summary = v, act.command
+        # Installed guard-rule packs: `mcp` rules on the call, `command` rules
+        # on each command line it amounts to. They only tighten.
+        commands = [act.command for act in actions if len(act.command) <= MAX_JUDGED_CHARS]
+        worst, pack_error, pack_problem = _with_packs(
+            worst, commands=tuple(dict.fromkeys(commands)), tool=tool_name, args=arguments)
+        if record:
+            _record_pack_trouble(pack_error, pack_problem,
+                                 judged=worst is not None or stop is not None, harness=harness,
+                                 tool=tool_name, command=summary, session_id=session_id)
         if worst is None and stop is None:
             return {**note, "harness": harness, "mcp_tool": tool_name} if note else None
         answer, recorded = _against_budget(worst, stop)
@@ -2656,7 +3233,11 @@ _BUDGET_CAP_ARGS = ("mode", "plan_cost", "spend_cap", "monthly_tokens", "session
 # against (budget_lens): raising or deleting one lifts the budget stop just as
 # surely. Any call asks.
 _CLOUD_BUDGET_TOOLS = ("set_budget", "delete_budget", "sync_budgets_from_yaml")
-_CHANGE_TYPES = ("ai_budget_change", "budget_change", "guard_change")
+_CHANGE_TYPES = ("ai_budget_change", "budget_change", "guard_change", "org_change",
+                 "pack_change", "protected_write")
+# Verdicts on an MCP call that the infrastructure it amounts to is judged
+# with: a change to the guard or its files, and code too long to read.
+_JUDGED_WITH = (*_CHANGE_TYPES, "oversize_command")
 _SHOWN_VALUE_MAX = 80
 
 
@@ -2689,10 +3270,36 @@ def _budget_change(tool_name: str, arguments: Any) -> dict[str, Any] | None:
 
 # The same changes made from the shell: `nable ai-budget --spend-cap ...`,
 # `nable budget ci-gate --budget-file ...` (it syncs the file's budgets
-# first), and taking the guard out (`nable guard uninstall`, `nable
-# uninstall`). An agent stopped by a budget could otherwise lift it, or remove
-# the hook, in one command. `budget status` and `refresh` only read.
-_NABLE = r"(?<![\w-])(?:nable|finops)\s"
+# first), and taking the guard out (`nable guard uninstall`, `nable guard
+# off`, `nable uninstall`). An agent stopped by a budget could otherwise lift it, or remove
+# the hook, in one command. `budget status` and `refresh` only read. And
+# `nable org confirm|reject|set|trust`, which record a person's decision.
+# Every way to start the CLI counts: nable, finops and finops-mcp (a path in
+# front, or a uvx pin like `finops-mcp@1.2` or `finops-mcp[aws]==1.2`), and
+# `python -m finops.setup_wizard`, `-m finops.entry` or `-m finops.server`.
+_NABLE = (r"(?:(?<![\w-])(?:nable|finops|finops-mcp)(?:\[[\w,.-]*\])?(?:(?:@|==)[\w.+!*-]*)?"
+          r"|(?<![\w-])-m\s*finops\.(?:setup_wizard|entry|server))\s")
+
+
+class _PythonApiCall:
+    """Code that imports one of nable's modules and calls a function that
+    changes what the guard allows, in a one-liner or a heredoc: `python3 -c
+    "from finops.org import store; store.confirm(...)"` decides an org fact as
+    surely as `nable org confirm`. (The org API also wants a decision the CLI
+    built; this is the seatbelt.) The code is not one shell segment, so the
+    rest of the command after the module's name is searched."""
+
+    def __init__(self, pattern: str, module: str, names: str) -> None:
+        self.pattern = pattern
+        self._module = _Lazy(module)
+        self._call = _Lazy(rf"(?<![\w])(?:{names})(?![\w])\s*\("
+                           rf"|(?:\.|\bimport\s|,)\s*(?:{names})(?![\w])")
+
+    def search(self, cmd: str) -> re.Match[str] | None:
+        mod = self._module.search(cmd)
+        return self._call.search(cmd, mod.end()) if mod else None
+
+
 _SELF_RULES: dict[str, tuple[Any, str, str]] = {r.pattern: (r, action, what) for r, action, what in (
     (_VerbWithFlag("ai-budget-change", _NABLE, rf"(?<!\S)ai-budget{_END}",
                    r"\s--(?:plan-cost|spend-cap|tokens|session-cap|reset)(?![\w-])",
@@ -2703,8 +3310,38 @@ _SELF_RULES: dict[str, tuple[Any, str, str]] = {r.pattern: (r, action, what) for
      "budget_change", "changing the cloud budgets the guard checks changes against"),
     (_VerbWithFlag("guard-uninstall", _NABLE, rf"(?<!\S)guard{_END}", rf"\suninstall{_END}"),
      "guard_change", "removing the guard's own hook"),
+    (_VerbWithFlag("guard-off", _NABLE, rf"(?<!\S)guard{_END}", rf"\soff{_END}"),
+     "guard_change", "turning the guard off"),
     (_VerbWithFlag("nable-uninstall", _NABLE, rf"(?<!\S)uninstall{_END}", r""),
      "guard_change", "uninstalling nable, the guard's hook with it"),
+    # Confirming, rejecting or setting an org fact is a person's decision, and
+    # a confirmed fact can change which budget and threshold apply. The CLI
+    # refuses without a terminal unless --as names someone, so an agent could
+    # otherwise sign a person's name. Reading (status, review, questions,
+    # export) stays silent.
+    (_VerbWithFlag("org-decide", _NABLE, rf"(?<!\S)org{_END}",
+                   rf"\s(?:confirm|reject|set|trust){_END}"),
+     "org_change", "deciding an org model fact for a person"),
+    (_VerbWithFlag("org-decide-module", r"(?<![\w.-])finops\.org\.cli(?![\w.])",
+                   rf"(?<!\S)(?:confirm|reject|set|trust){_END}", r""),
+     "org_change", "deciding an org model fact for a person"),
+    (_PythonApiCall("org-decide-api", r"finops\.org(?![\w-])",
+                    r"confirm|reject|set_fact|confirm_many|reject_many|import_legacy|trust"),
+     "org_change", "deciding an org model fact for a person"),
+    (_PythonApiCall("guard-off-api", r"finops(?:\.guard_plugin|\.guard)?(?![\w.-])",
+                    r"set_off|uninstall"),
+     "guard_change", "turning the guard off"),
+    # Installing a pack grants it capabilities (and may add code the broker
+    # runs); updating one can change its rules; removing a guard-rule pack
+    # takes its asks and denies away; a signature or a key made here is what
+    # packs.trusted_keys would trust; a secret set for a pack hands it a
+    # credential from nable's vault. Reading (list, audit, search, validate,
+    # new, which writes only the directory it is given) stays silent.
+    (_VerbWithFlag("pack-change", _NABLE,
+                   rf"(?<!\S)pack(?:\s+-\S+)*\s+(?:install|update|remove|sign|keygen"
+                   rf"|secret(?:\s+-\S+)*\s+(?:set|remove)){_END}",
+                   r""),
+     "pack_change", "changing the installed packs, which decide what the guard asks about"),
 )}
 
 
@@ -2731,6 +3368,894 @@ def _self_change(command: str) -> dict[str, Any] | None:
         shown = shown[:_SHOWN_COMMAND_MAX - 3] + "..."
     return {"decision": "ask", "action_type": action_type, "door": None,
             "reason": f"nable guard: the agent is {what} (`{shown}`); a human should confirm."}
+
+
+# ── Writes to the guard's own files ───────────────────────────────────────────
+# The org model, the policy file, the installed packs, the off flag, the
+# ledger and the harness settings that carry the hook decide what the guard
+# allows (guard_paths.protected lists them). `nable org confirm` and `nable
+# guard off` ask, but appending a confirmed threshold to nable.org/policy.yaml,
+# `touch ~/.finops/guard-off` or `rm -rf ~/.finops/packs/...` used to change
+# the same things in silence. So a shell command that writes, moves, deletes,
+# links, truncates or changes the permissions of one asks. Reading one (cat,
+# grep, less, git diff, cp FROM it) stays silent.
+#
+# Each shell command is read in the forms the price reader uses (_segmented:
+# quotes and escapes dropped, aliases expanded, one command per segment, a
+# commit message's quoted text blanked where the shell will not run it), so
+# `"~/.fin""ops/guard-off"` and `t\ee` are what the shell will run. A path is
+# resolved as the shell would open it: variables assigned earlier on the line
+# and in the environment, `~`, a `cd` earlier in the command, braces, globs
+# and symlinks (guard_paths.match). A command inside `$(...)`, backticks or
+# `<(...)` is read as a command of its own. What it cannot see: a path built
+# at run time (the output of `$(...)`, a loop variable) and a write inside a
+# script the command runs; `nable guard doctor` lists those gaps.
+
+# A cheap first look: nothing that can write a file is named.
+_WRITE_HINT_RE = re.compile(
+    r">|(?<![\w.-])(?:rm|rmdir|unlink|shred|mv|cp|ln|install|rsync|tee|sed|perl|ruby|awk|gawk|"
+    r"chmod|chown|chgrp|chattr|setfacl|truncate|dd|touch|mkdir|patch|sponge|yq|sd|curl|wget|"
+    r"n?vim?|ex|ed|emacs|nano|find|git|python[\d.]*|node|deno|bun|php|pwsh|powershell|"
+    r"osascript|lua)(?![\w-])")
+# Output redirections into a file: `>`, `>>`, `>|`, `&>`, `2>`, `<>` (not
+# `>&2`). The target may be written right against the operator.
+_REDIRECT_RE = re.compile(r"(?:\d+|&)?(?:>>?\|?|<>)(?![&>])\s*([^\s;&|<>()]+)")
+_INPUT_RE = re.compile(r"\d*<(?:<-?|<<)?\s*[^\s;&|<>()]+")
+_SPECIAL_FILES = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty")
+_ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
+# Words that run the rest of the words as a command: the flags each takes a
+# value for, so `sudo -u root rm x` is rm.
+_WRAPPERS: dict[str, frozenset[str]] = {
+    "sudo": frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "--user",
+                       "--group"}),
+    "doas": frozenset({"-u", "-C"}), "env": frozenset({"-u", "-C", "--unset", "--chdir"}),
+    "nice": frozenset({"-n"}), "ionice": frozenset({"-c", "-n", "-p"}),
+    "timeout": frozenset({"-s", "-k", "--signal", "--kill-after"}),
+    "xargs": frozenset({"-I", "-n", "-P", "-L", "-d", "-a", "-E", "-s"}),
+    "stdbuf": frozenset(), "nohup": frozenset(), "time": frozenset(), "command": frozenset(),
+    "exec": frozenset({"-a"}), "builtin": frozenset(), "setsid": frozenset(),
+    "unbuffer": frozenset(), "caffeinate": frozenset(), "chronic": frozenset(),
+    "then": frozenset(), "do": frozenset(), "else": frozenset(), "if": frozenset(),
+    "while": frozenset(), "until": frozenset(), "!": frozenset(), "{": frozenset(),
+    "eval": frozenset(),
+}
+# Wrappers whose first plain word is theirs, not the command's.
+_WRAPPER_ARG = {"timeout": 1, "flock": 1}
+# Project runners: `uv run python -c ...` runs python. The flags each takes a
+# value for, so `uv run --with x python` is python.
+_RUNNERS: dict[str, frozenset[str]] = {
+    "uv": frozenset({"--with", "-w", "--python", "-p", "--project", "--directory", "--package",
+                     "--extra", "--group", "--env-file", "--index", "--index-url",
+                     "--default-index", "--extra-index-url", "--with-requirements",
+                     "--with-editable", "--only-group", "--no-group", "--config-file",
+                     "--cache-dir"}),
+    "poetry": frozenset({"-C", "--directory", "-P", "--project"}),
+    "pipenv": frozenset(), "pdm": frozenset({"-p", "--project"}),
+    "hatch": frozenset({"-e", "--env"}),
+    "conda": frozenset({"-n", "--name", "-p", "--prefix"}),
+}
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "busybox"})
+_DECLARE = frozenset({"export", "declare", "local", "readonly", "typeset"})
+_DELETES = frozenset({"rm", "unlink", "shred", "rmdir", "srm", "trash", "trash-put", "gio"})
+_PERMS = frozenset({"chmod", "chown", "chgrp", "chattr", "setfacl", "xattr"})
+_WRITES = frozenset({"tee", "touch", "mkdir", "truncate", "sponge", "sd", "patch"})
+_EDITORS = frozenset({"vi", "vim", "nvim", "ex", "ed", "emacs", "nano", "micro", "hx", "kak",
+                      "joe", "mcedit"})
+_COPIES = frozenset({"cp", "install", "rsync", "ln", "mv", "scp"})
+_INTERPRETERS_RE = re.compile(r"(?:python[\d.]*|node(?:js)?|deno|bun|ruby|perl|php|pwsh|"
+                              r"powershell|osascript|lua|tclsh)")
+# Code that writes, deletes or runs something, in a one-liner or a heredoc.
+_CODE_WRITE_RE = re.compile(
+    r"write_(?:text|bytes)|\.write\s*\(|"
+    r"unlink|remove|rmtree|rename|replace\s*\(|truncate|chmod|chown|symlink|copy|move\s*\(|"
+    r"mkdir|makedirs|touch\s*\(|writeFile|appendFile|rmSync|rmdir|system\s*\(|subprocess|"
+    r"popen|fopen|file_put_contents|Set-Content|Out-File|Remove-Item|Add-Content|New-Item|"
+    r"Copy-Item|Move-Item|shutil|exec")
+# open() with a mode that writes, the call's arguments read up to
+# _OPEN_ARGS_MAX characters on (nested calls included: `open(os.path.
+# expanduser('~/x'), 'w')`). The two halves are found separately and paired
+# by position, so a run of `open(f, ` costs one pass, never one per call.
+_OPEN_CALL_RE = _Lazy(r"open\s{0,8}\(")
+_OPEN_MODE_RE = _Lazy(r",\s{0,8}(?:mode\s{0,8}=\s{0,8})?[rbt]{0,3}[wax+]")
+_OPEN_ARGS_MAX = 512
+_CODE_TOKEN_SPLIT_RE = re.compile(r"[^\w.~${}/\-]+")
+_CODE_TOKENS_MAX = 400
+# The code of an interpreter one-liner: `python3 -c CODE`, `node -e CODE`,
+# `perl -ne CODE`, `ruby -e CODE`. Code longer than _CODE_MAX_CHARS asks,
+# as a command over MAX_JUDGED_CHARS does: the checks on code are
+# heuristics, and a human should read that much of it.
+_ONE_LINER_RE = _Lazy(
+    r"(?<![\w.-])(?:python[\d.]*|node(?:js)?|perl|ruby)(?:\s+-[\w=-]*+)*?"
+    r"\s+(?:-[A-Za-z]*[ceE]|--eval|--print)(?=[\s'\"$])\s*")
+_UNQUOTED_WORD_RE = _Lazy(r"\S*")
+_CODE_MAX_CHARS = 16 * 1024
+
+
+def _code_writes(form: str) -> bool:
+    """Does the code in `form` write, delete or run something? Linear."""
+    if _CODE_WRITE_RE.search(form):
+        return True
+    import bisect
+    opens = [m.end() for m in _OPEN_CALL_RE.finditer(form)]
+    if not opens:
+        return False
+    for m in _OPEN_MODE_RE.finditer(form, opens[0]):
+        k = bisect.bisect_right(opens, m.start())
+        if k and m.start() - opens[k - 1] <= _OPEN_ARGS_MAX:
+            return True
+    return False
+
+
+def _oversize_code(command: str) -> dict[str, Any] | None:
+    """An ask for an interpreter one-liner whose code is longer than
+    _CODE_MAX_CHARS, else None. Each one's code is measured once."""
+    if len(command) <= _CODE_MAX_CHARS:
+        return None
+    covered = 0
+    for m in _ONE_LINER_RE.finditer(command):
+        at = m.end()
+        if at < covered or at >= len(command):
+            continue
+        word = (_SHELL_LEX_RE.match(command, at) if command[at] in "'\"$" else None) \
+            or _UNQUOTED_WORD_RE.match(command, at)
+        covered = word.end()
+        if covered - at > _CODE_MAX_CHARS:
+            return {"decision": "ask", "action_type": "oversize_command", "door": None,
+                    "reason": (f"nable guard: this command runs {(covered - at) / 1024:,.0f} KB "
+                               "of code in an interpreter one-liner, longer than the "
+                               f"{_CODE_MAX_CHARS // 1024} KB the guard reads in one. A human "
+                               "should read it before it runs.")}
+    return None
+
+
+def _next_plain(words: list[str], i: int, takes: frozenset[str]) -> int:
+    """Index of the first word from `i` that is not a flag (or a flag's value)."""
+    while i < len(words):
+        w = words[i]
+        if w == "--":
+            return i + 1
+        if not w.startswith("-") or w == "-":
+            return i
+        i += 2 if w in takes else 1
+    return i
+
+
+def _plain_args(words: list[str]) -> list[str]:
+    """The words that are not flags; everything after `--` counts."""
+    out, rest = [], False
+    for w in words:
+        if rest or not w.startswith("-") or w == "-":
+            out.append(w)
+        elif w == "--":
+            rest = True
+    return out
+
+
+def _flag_value(words: list[str], shorts: tuple[str, ...], longs: tuple[str, ...]) -> str | None:
+    """The value of a flag given as `-t DIR`, `-tDIR`, `--target DIR` or
+    `--target=DIR`, or None."""
+    for i, w in enumerate(words):
+        for s in shorts:
+            if w == s and i + 1 < len(words):
+                return words[i + 1]
+            if w.startswith(s) and len(w) > len(s) and not w.startswith("--"):
+                return w[len(s):]
+            # A cluster that ends in the flag takes the next word: `curl -so FILE`.
+            if (len(w) > 2 and w[0] == "-" and w[1] != "-" and w[-1] == s[-1]
+                    and w[1:].isalpha() and i + 1 < len(words)):
+                return words[i + 1]
+        for lg in longs:
+            if w == lg and i + 1 < len(words):
+                return words[i + 1]
+            if w.startswith(lg + "="):
+                return w[len(lg) + 1:]
+    return None
+
+
+def _has_short(words: list[str], letters: str, stop: str = "") -> bool:
+    """A short flag cluster carries one of `letters` (`-pi` has i). Scanning a
+    cluster stops at a letter in `stop`, whose value follows attached
+    (perl's `-MFile::Find` is not -i)."""
+    for w in words:
+        if w == "--":
+            return False
+        if not w.startswith("-") or w.startswith("--") or len(w) < 2:
+            continue
+        for ch in w[1:]:
+            if ch in letters:
+                return True
+            if ch in stop:
+                break
+    return False
+
+
+# The paths one command's check looks at, however many readings name them,
+# and the work it may do on them (guard_paths.meter: a unit is a realpath of
+# a path of a dozen parts, or a directory listing of a few dozen names). A command that
+# names more than this asks instead, so that one padded with thousands of
+# `a* b* ...` or `cd a/a/a/...` still gets its answer in the hook's time.
+_PATHS_MAX = 2048
+_PATH_UNITS = 4096
+
+
+class _TooManyPaths(Exception):
+    pass
+
+
+class _PathChecks:
+    """What one command's paths were found to be, each looked at once."""
+
+    __slots__ = ("left", "seen")
+
+    def __init__(self) -> None:
+        self.seen: dict[Any, Any] = {}
+        self.left = _PATHS_MAX
+
+    def once(self, key: Any, look: Any) -> Any:
+        if key in self.seen:
+            return self.seen[key]
+        self.left -= 1
+        if self.left < 0:
+            raise _TooManyPaths
+        out = self.seen[key] = look()
+        return out
+
+
+def _env_key(path: str, env: dict[str, str] | None) -> tuple[Any, ...] | None:
+    """The values of the variables `path` reads, and of those theirs read:
+    what a look at it depends on besides the path."""
+    if "$" not in path or not env:
+        return None
+    from . import guard_paths
+    out: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    todo = [path]
+    for _ in range(4):                  # as deep as guard_paths expands them
+        nxt = []
+        for text in todo:
+            for a, b in guard_paths._VAR_RE.findall(text):
+                if (a or b) not in seen:
+                    seen.add(a or b)
+                    val = env.get(a or b)
+                    out.append((a or b, val))
+                    if val and "$" in val:
+                        nxt.append(val)
+        todo = nxt
+    return tuple(out)
+
+
+def _copy_targets(prog: str, args: list[str], base: str = "",
+                  env: dict[str, str] | None = None, entries: list[Any] = (),
+                  checks: _PathChecks | None = None) -> list[tuple[str, bool]]:
+    """(path, ancestors too) for what cp, install, rsync, ln, scp and mv
+    write: the destination, and the file each source lands as in it when the
+    destination is a directory (a glob source, as each name it expands to).
+    mv also takes its sources away, and ln links to them."""
+    from . import guard_paths
+    target = _flag_value(args, ("-t",), ("--target-directory",))
+    plain = _plain_args(args)
+    if target is not None:
+        plain = [p for p in plain if p != target]
+        srcs, dests = plain, [target]
+    elif len(plain) >= 2 or (prog == "ln" and plain):
+        srcs, dests = plain[:-1], plain[-1:]
+        if prog == "ln" and len(plain) == 1:
+            srcs, dests = plain, []
+    else:
+        return []
+    recursive = _has_short(args, "rRa") or any(
+        a in ("--recursive", "--archive", "--no-target-directory") for a in args)
+    out: list[tuple[str, bool]] = []
+    wanted: set[str] | None = None
+    for d in dests:
+        out.append((d, recursive and (_has_short(args, "T") or any(
+            s.endswith(("/.", "/")) for s in srcs))))
+        # `cp budget.yml budget.yml.bak` writes budget.yml.bak, not
+        # budget.yml.bak/budget.yml: a source lands inside the destination
+        # only when that is a directory (or cannot be told not to be one).
+        if target is None and len(srcs) == 1 and not d.endswith("/") and prog != "scp":
+            real = guard_paths.resolve(d.replace("\x00", " "), base or None, env=env)
+            if real is not None and not os.path.isdir(real):
+                continue
+        for s in srcs:
+            name = s.rstrip("/").rsplit("/", 1)[-1]
+            if not name or name in (".", ".."):
+                continue
+            landed = [name]
+            if guard_paths._GLOB_CHARS & set(name):
+                # `cp config/*.yaml deploy/` lands budget.yaml in deploy/ only
+                # when config/ holds one: the names the glob expands to that
+                # could be (or lead to) a protected file.
+                src = s.rstrip("/").replace("\x00", " ")
+                names = (checks or _PathChecks()).once(
+                    ("glob", src, base, _env_key(src, env)),
+                    lambda src=src: guard_paths.glob_names(src, base or None, env=env))
+                wanted = wanted if wanted is not None else _landing_names(entries)
+                landed = sorted(wanted) if names is None else [
+                    n for n in names if (n.casefold() if guard_paths._FOLD else n) in wanted]
+            out += [(f"{d.rstrip('/')}/{n}", recursive) for n in landed]
+    if prog == "mv" or (prog == "rsync" and "--remove-source-files" in args):
+        out += [(s, True) for s in srcs]
+    elif prog == "ln":
+        out += [(s, False) for s in srcs]
+    return out
+
+
+def _landing_names(entries: list[Any]) -> set[str]:
+    """The file names a copy could land as and change something protected:
+    each part of each protected path, a budget file's name, nable.org."""
+    from . import guard_paths
+    out = {part for e in entries for part in e.path.split(os.sep) if part}
+    return out | set(guard_paths.PROTECTED_NAMES) | {guard_paths.ORG_DIR_NAME}
+
+
+def _git_targets(args: list[str], base: str) -> tuple[list[tuple[str, Any]], str]:
+    """(targets, directory) for a git command: checkout and restore of paths,
+    rm, mv and clean. `git -C dir` and `--work-tree=dir` move the directory."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        w = args[i]
+        if w == "-C" and i + 1 < len(args):
+            base = os.path.join(base, os.path.expanduser(args[i + 1]))
+            i += 2
+            continue
+        if w.startswith("--work-tree="):
+            base = os.path.join(base, os.path.expanduser(w.split("=", 1)[1]))
+        i += 2 if w in ("-c", "--git-dir", "--work-tree", "--namespace") else 1
+    if i >= len(args):
+        return [], base
+    sub, rest = args[i], args[i + 1:]
+    if sub in ("checkout", "restore"):
+        source = any(w in ("-s", "--source") or w.startswith("--source=") for w in rest)
+        if sub == "restore" and (_has_short(rest, "S") or "--staged" in rest) and not (
+                _has_short(rest, "W") or "--worktree" in rest):
+            return [], base             # the index only
+        rest = [w for j, w in enumerate(rest)
+                if not (j and rest[j - 1] in ("-b", "-B", "--orphan", "-s", "--source"))]
+        paths = _plain_args(rest)
+        if sub == "checkout" and "--" in rest and any(
+                not w.startswith("-") for w in rest[:rest.index("--")]):
+            source = True               # `git checkout HEAD~3 -- .`
+            paths = rest[rest.index("--") + 1:]
+        elif sub == "checkout" and len(paths) > 1:
+            source = True               # `git checkout HEAD~3 .`: a commit, then paths
+        # A path named, and what git would put back under one (`git checkout
+        # .` puts back every changed file under it, the org model's among
+        # them; from another commit, every tracked one).
+        mode = "tracked" if source else "changed"
+        return [(p, False) for p in paths] + [(p, mode) for p in paths], base
+    if sub == "stash" and (not rest or rest[0] in ("push", "save", "pop", "apply")
+                           or rest[0].startswith("-")):
+        # It takes back the changes to every tracked file in the repo (or
+        # under the pathspecs after `--`), untracked ones too with -u or -a;
+        # pop and apply put back whatever the stash holds.
+        from . import guard_paths
+        spec = rest[rest.index("--") + 1:] if "--" in rest else []
+        root = guard_paths.git_root(base)
+        if rest and rest[0] in ("pop", "apply"):
+            mode = "tracked"
+        elif _has_short(rest, "ua") or any(w in ("--include-untracked", "--all") for w in rest):
+            mode = "exists"
+        else:
+            mode = "changed"
+        return [(p, mode) for p in (spec or [str(root) if root else "."])], base
+    if sub == "rm" and "--cached" in rest:
+        # The index only: the files stay, but the next commit drops what is
+        # tracked from the repo (nable.org/ with it) for everyone else.
+        return [(p, "tracked") for p in _plain_args(rest)], base
+    if sub in ("rm", "mv"):
+        return [(p, True) for p in _plain_args(rest)], base
+    if sub == "clean" and (_has_short(rest, "f") or "--force" in rest) and not (
+            _has_short(rest, "n") or "--dry-run" in rest):
+        # It deletes what is untracked, so only a protected file that is there.
+        return [(p, "exists") for p in (_plain_args(rest) or ["."])], base
+    return [], base
+
+
+def _write_targets(prog: str, args: list[str], base: str,
+                   env: dict[str, str] | None = None, entries: list[Any] = (),
+                   checks: _PathChecks | None = None) -> tuple[list[tuple[str, Any]], str]:
+    """(path, ancestors) for each path this command writes, and the
+    directory its relative paths are from. `ancestors` is True when writing
+    to a directory also changes what is in it (rm -r, mv, chmod -R), and
+    "exists" when only what is there is touched (a clean of untracked files)."""
+    if prog in _DELETES:
+        return [(p, True) for p in _plain_args(args)], base
+    if prog in _PERMS:
+        return [(p, True) for p in _plain_args(args)], base
+    if prog in _WRITES or prog in _EDITORS:
+        return [(p, False) for p in _plain_args(args)], base
+    if prog in _COPIES:
+        return _copy_targets(prog, args, base, env, entries, checks), base
+    if prog == "dd":
+        return [(a[3:], False) for a in args if a.startswith("of=")], base
+    if prog == "sed" and (_has_short(args, "i") or any(a.startswith("--in-place") for a in args)):
+        return [(p, False) for p in _plain_args(args)], base
+    if prog in ("perl", "ruby") and _has_short(args, "i", stop="eEMmIlx0CFKr"):
+        return [(p, False) for p in _plain_args(args)], base
+    if prog in ("awk", "gawk") and ("inplace" in args or "--include=inplace" in args):
+        return [(p, False) for p in _plain_args(args)], base
+    if prog == "yq" and (_has_short(args, "i") or "--inplace" in args):
+        return [(p, False) for p in _plain_args(args)], base
+    if prog == "curl":
+        out = _flag_value(args, ("-o",), ("--output",))
+        return ([(out, False)] if out else []), base
+    if prog == "wget":
+        out = _flag_value(args, ("-O",), ("--output-document",))
+        into = _flag_value(args, ("-P",), ("--directory-prefix",))
+        return [(p, False) for p in (out, into) if p], base
+    if prog == "find" and any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir")
+                              for a in args):
+        # It deletes (or runs something on) what it finds: a protected file
+        # that is there, under a starting point, with a name its -name tests
+        # allow. `find . -name '*.pyc' -delete` finds none of them.
+        names = tuple((args[i + 1], a == "-iname") for i, a in enumerate(args[:-1])
+                      if a in ("-name", "-iname"))
+        if len(names) > _FIND_NAMES_MAX:
+            names = ()                  # read as no filter: anything it finds
+        starts = []
+        for a in args:
+            if a.startswith(("-", "(", "!")):
+                break
+            starts.append((a, ("exists", names)))
+        return starts or [(".", ("exists", names))], base
+    if prog == "git":
+        return _git_targets(args, base)
+    return [], base
+
+
+def _command_words(words: list[str], env: dict[str, str]) -> list[str]:
+    """The words of the command a segment runs: assignments recorded in
+    `env` and taken off, wrappers (sudo, env, timeout, xargs, ...) and
+    `sh -c` taken off. [] for a segment that only assigns."""
+    i = 0
+    while i < len(words):
+        w = words[i].lstrip("({")
+        if not w:
+            i += 1
+            continue
+        if _ASSIGN_RE.match(w):
+            name, _, val = w.partition("=")
+            env[name] = val
+            i += 1
+            continue
+        prog = w.rsplit("/", 1)[-1]
+        if prog in _DECLARE:
+            for a in words[i + 1:]:
+                if _ASSIGN_RE.match(a):
+                    name, _, val = a.partition("=")
+                    env[name] = val
+            return []
+        if prog in _WRAPPERS or prog == "flock":
+            i = _next_plain(words, i + 1, _WRAPPERS.get(prog, frozenset()))
+            i += _WRAPPER_ARG.get(prog, 0)
+            continue
+        if prog in _RUNNERS:
+            j = _next_plain(words, i + 1, _RUNNERS[prog])
+            if prog == "uv" and words[j:j + 2] == ["tool", "run"]:
+                j += 1
+            if j < len(words) and words[j] == "run":
+                i = _next_plain(words, j + 1, _RUNNERS[prog])
+                continue
+        if prog in _SHELLS:
+            j = i + 1
+            if prog == "busybox" and j < len(words) and words[j].rsplit("/", 1)[-1] in _SHELLS:
+                j += 1
+            flag = next((n for n, a in enumerate(words[j:])
+                         if a.startswith("-") and not a.startswith("--") and "c" in a[1:]), None)
+            if flag is not None:
+                i = j + flag + 1
+                continue
+        return [prog, *words[i + 1:]]
+    return []
+
+
+def _code_target(form: str, cwd: str | None, entries: list[Any]) -> Any:
+    """For a command that runs an interpreter: a protected path the code
+    names, when the code also writes, deletes or runs something."""
+    if not _code_writes(form):
+        return None
+    from . import guard_paths
+    by_name = {os.path.basename(e.path): e for e in entries}
+    looked: set[str] = set()
+    for tok in _CODE_TOKEN_SPLIT_RE.split(form):
+        if not tok:
+            continue
+        name = tok.rstrip("/").rsplit("/", 1)[-1]
+        if name in guard_paths.DISTINCTIVE_NAMES:
+            return by_name.get(name) or guard_paths.Protected(tok, tok, f"{name}, one of the "
+                                                                   "guard's own files")
+        if ("/" in tok or tok.startswith("~")) and tok not in looked \
+                and len(looked) < _CODE_TOKENS_MAX:
+            looked.add(tok)
+            hit = guard_paths.match(tok, cwd, entries=entries, ancestors=True)
+            if hit is not None:
+                return hit
+    return None
+
+
+# The entries of a protected tree find's -name tests are tried against
+# before the tree is taken to hold a match, and the -name tests read.
+_FIND_WALK_MAX = 2048
+_FIND_NAMES_MAX = 64
+
+
+def _find_names_reach(entry: Any, names: tuple[tuple[str, bool], ...]) -> bool:
+    """Could `find ... -name PATTERN` reach `entry`? Its own name, or for a
+    tree (`find nable.org -name '*.yaml' -exec sed -i ...`), any name inside
+    it. A tree larger than _FIND_WALK_MAX entries is taken to hold one."""
+    import fnmatch
+
+    def hit(name: str) -> bool:
+        return any(fnmatch.fnmatchcase(name.casefold(), n.casefold()) if ci
+                   else fnmatch.fnmatchcase(name, n) for n, ci in names)
+    if hit(os.path.basename(entry.path)):
+        return True
+    if not entry.tree:
+        return False
+    from . import guard_paths
+    seen = 0
+    for _dirpath, dirnames, filenames in os.walk(entry.path):
+        seen += len(dirnames) + len(filenames) + 1
+        guard_paths.charge(1 + (len(dirnames) + len(filenames)) // guard_paths._UNIT_ENTRIES)
+        if seen > _FIND_WALK_MAX or any(hit(n) for n in (*dirnames, *filenames)):
+            return True
+    return False
+
+
+def _spaced(form: str, entries: list[Any]) -> str:
+    """A protected path with a space in it (`Application Support`) kept as
+    one word: its spaces become NUL (never whitespace, never in a real path),
+    which hit_of and cd turn back."""
+    for e in entries:
+        for p in (e.path, e.shown):
+            if " " in p and p in form:
+                form = form.replace(p, p.replace(" ", "\x00"))
+    return form
+
+
+def _git_would_change(path: str, mode: str, where: str, env: dict[str, str],
+                      entries: list[Any]) -> Any:
+    """The protected entry under `path` that a checkout, restore or stash
+    there would change: one git tracks ("tracked"), and ("changed") has
+    changed since HEAD last moved. Where git's records cannot be read, one
+    that is there."""
+    from . import guard_paths
+    real = guard_paths.resolve(path, where, env=env)
+    if real is None:
+        return None
+    root = guard_paths.git_root(real)
+    for e in entries:
+        if not (guard_paths.is_under(e.path, real)
+                or (e.tree and guard_paths.is_under(real, e.path))):
+            continue
+        tracked = guard_paths.git_tracked(e.path, str(root), e.tree) if root else None
+        if tracked is None:
+            if os.path.lexists(e.path):
+                return e
+        elif tracked and (mode == "tracked" or guard_paths.git_changed(
+                e.path, str(root), e.tree) is not False):
+            return e
+    return None
+
+
+# What starts a command substitution (`$(...)`, a backtick) or a process
+# substitution (`<(...)`, `>(...)`), and the parentheses that close one.
+_SUBST_TOKEN_RE = _Lazy(r"\$\(|[<>]\(|[()`]")
+_SUBST_OPENERS = ("$(", "<(", ">(")
+# Between the bodies of substitutions judged together: a word no command has,
+# which puts the directory back where the command's own `cd`s left it.
+_BODY_BREAK = "\x01"
+_BODY_BASES_MAX = 8
+
+
+def _substitutions(form: str) -> tuple[str, list[str]]:
+    """(`form` with the body of each substitution in it replaced by a plain
+    word, those bodies with theirs replaced likewise). `x=$(touch F)` writes F
+    as surely as `touch F` does, but read as words it is an assignment and a
+    word `F)`. One pass: each character is copied once, however deep the
+    nesting. An unterminated body runs to the end."""
+    stack: list[list[Any]] = [[[], 0, None]]      # [parts, open parens, opener]
+    bodies: list[str] = []
+    last = 0
+    for m in _SUBST_TOKEN_RE.finditer(form):
+        top = stack[-1]
+        top[0].append(form[last:m.start()])
+        last = m.end()
+        tok = m.group()
+        if tok in _SUBST_OPENERS or (tok == "`" and top[2] != "`"):
+            top[0].append(" _ ")
+            stack.append([[], 0, tok])
+        elif len(stack) > 1 and (tok == "`" or (tok == ")" and top[1] == 0 and top[2] != "`")):
+            bodies.append("".join(stack.pop()[0]))
+        else:
+            top[1] = top[1] + 1 if tok == "(" else max(0, top[1] - (tok == ")"))
+            top[0].append(tok)
+    stack[-1][0].append(form[last:])
+    while len(stack) > 1:
+        bodies.append("".join(stack.pop()[0]))
+    return "".join(stack[0][0]), bodies
+
+
+def _protected_target(form: str, cwd: str | None, entries: list[Any],
+                      checks: _PathChecks | None = None) -> Any:
+    """The protected entry one normalized form of a command writes to, or None.
+    The body of each substitution is judged as a command of its own, from
+    every directory a `cd` in the command moves to."""
+    # `>|` (write even under noclobber) is a redirection, not a pipe.
+    form = _spaced(form, entries).replace(">|", "> ")
+    base = cwd or os.getcwd()
+    checks = checks or _PathChecks()
+    if "(" not in form and "`" not in form:
+        return _protected_commands(form, form, base, entries, {}, [], checks)
+    outer, bodies = _substitutions(form)
+    env: dict[str, str] = {}
+    bases: list[str] = []
+    hit = _protected_commands(outer, form, base, entries, env, bases, checks)
+    if hit is not None or not bodies:
+        return hit
+    joined = f" ; {_BODY_BREAK} ; ".join(bodies)
+    if not _WRITE_HINT_RE.search(joined):
+        return None
+    for b in dict.fromkeys([base, *bases][:_BODY_BASES_MAX]):
+        hit = _protected_commands(joined, joined, b, entries, dict(env), [], checks)
+        if hit is not None:
+            return hit
+    return None
+
+
+def _protected_commands(form: str, code: str, base: str, entries: list[Any],
+                        env: dict[str, str], bases: list[str], checks: _PathChecks) -> Any:
+    """_protected_target over the commands of `form`, from `base`, with `env`
+    (assignments, updated) and `bases` (each `cd`, appended). `code` is what
+    an interpreter's code is read from."""
+    from . import guard_paths
+    start = base
+    interpreter = False
+
+    def hit_of(path: str, ancestors: Any = False, where: str | None = None) -> Any:
+        path = path.replace("\x00", " ")
+        if path in _SPECIAL_FILES or path.startswith("/dev/fd/") or not path:
+            return None
+        key = (path, repr(ancestors), where or base, _env_key(path, env))
+        return checks.once(key, lambda: look(path, ancestors, where))
+
+    def look(path: str, ancestors: Any, where: str | None) -> Any:
+        if ancestors in ("changed", "tracked"):
+            return _git_would_change(path, ancestors, where or base, env, entries)
+        if isinstance(ancestors, tuple) or ancestors == "exists":
+            # Only what is there: a clean of untracked files, a find -delete
+            # (whose -name patterns, when it has any, must match a name in
+            # it), a checkout or stash that puts files back.
+            names = ancestors[1] if isinstance(ancestors, tuple) else ()
+            real = guard_paths.resolve(path, where or base, env=env)
+            if real is None:
+                return None
+            for e in entries:
+                if e.tree and guard_paths.is_under(real, e.path) and os.path.lexists(real):
+                    return e            # it starts inside a protected tree
+                if (guard_paths.is_under(e.path, real) and os.path.lexists(e.path)
+                        and (not names or _find_names_reach(e, names))):
+                    return e
+            return None
+        return guard_paths.match(path, where or base, entries=entries, ancestors=ancestors,
+                                 env=env)
+
+    for seg, _at in _commands_in(form):
+        if seg.strip() == _BODY_BREAK:
+            base = start
+            continue
+        for m in _REDIRECT_RE.finditer(seg):
+            hit = hit_of(m.group(1))
+            if hit is not None:
+                return hit
+        seg = _INPUT_RE.sub(" ", _REDIRECT_RE.sub(" ", seg))
+        words = _command_words(seg.split(), env)
+        if not words:
+            continue
+        prog, args = words[0], words[1:]
+        if prog in ("cd", "pushd"):
+            plain = _plain_args(args)
+            dest = plain[0] if plain else "~"
+            if dest != "-":
+                dest = dest.replace("\x00", " ")
+                dest = checks.once(("cd", dest, base, _env_key(dest, env)),
+                                   lambda d=dest, b=base: guard_paths.resolve(d, b, env=env))
+                base = dest or base
+                if len(bases) < _BODY_BASES_MAX:
+                    bases.append(base)
+            continue
+        if _INTERPRETERS_RE.fullmatch(prog):
+            interpreter = True
+        targets, where = _write_targets(prog, args, base, env, entries, checks)
+        for path, ancestors in targets:
+            hit = hit_of(path, ancestors, where)
+            if hit is not None:
+                return hit
+    if interpreter:
+        return _code_target(code, start, entries)
+    return None
+
+
+def _protected_write(command: str, cwd: str | None = None) -> dict[str, Any] | None:
+    """An ask for a shell command that writes to one of the guard's own
+    files (guard_paths), or None. Every reading of the command counts; a
+    path only in a commit message's quoted text does not."""
+    if not _WRITE_HINT_RE.search(command) and not _WRITE_HINT_RE.search(
+            command.replace("\\", "").replace('"', "").replace("'", "")):
+        return None
+    from . import guard_paths
+    entries = guard_paths.protected(cwd)
+    found: dict[str, Any] = {}
+    checks = _PathChecks()
+
+    def judge(form: str) -> tuple[str, str] | None:
+        hit = _protected_target(form, cwd, entries, checks)
+        if hit is None:
+            return None
+        found[hit.path] = hit
+        return ("protected", hit.path)
+
+    r = _readings(command)
+    token = guard_paths.meter(_PATH_UNITS)
+    try:
+        for masked in (True, False):
+            for split in (False, True):
+                h = judge(_segmented(command, split, masked))
+                if h is not None and (masked or not _only_in_data(r, h, judge)):
+                    return _protected_verdict(found[h[1]], command=command)
+    except (_TooManyPaths, guard_paths.TooMuch):
+        return _too_many_paths_verdict()
+    finally:
+        guard_paths.unmeter(token)
+    return None
+
+
+def _too_many_paths_verdict() -> dict[str, Any]:
+    return {"decision": "ask", "action_type": "oversize_command", "door": None,
+            "reason": ("nable guard: this command names more paths than the guard checks for "
+                       "its own files before its hook times out. A human should read it "
+                       "before it runs.")}
+
+
+def _protected_verdict(entry: Any, *, command: str | None = None,
+                       tool: str | None = None) -> dict[str, Any]:
+    if command is not None:
+        shown = " ".join(command.split())
+        if len(shown) > _SHOWN_COMMAND_MAX:
+            shown = shown[:_SHOWN_COMMAND_MAX - 3] + "..."
+        how = f"`{shown}`"
+    else:
+        how = f"its {tool} tool"
+    return {"decision": "ask", "action_type": "protected_write", "door": None,
+            "protected_path": entry.shown,
+            "reason": (f"nable guard: the agent is changing {entry.what} ({entry.shown}) with "
+                       f"{how}. That file decides what the guard allows, so a human should "
+                       "confirm.")}
+
+
+def gate_editor(tool_name: str, tool_input: Any, *, cwd: str | None = None,
+                harness: str = "claude-code", session_id: str | None = None,
+                record: bool = True) -> dict[str, Any] | None:
+    """Claude Code's file tools (Write, Edit, MultiEdit, NotebookEdit): an
+    ask when the file is one of the guard's own (guard_paths), else None and
+    nothing recorded. guard_plugin answers the None case before the guard is
+    imported; this is the same check, for a call that reaches the guard."""
+    from . import guard_plugin
+    path = None
+    try:
+        found = guard_plugin.editor_target(tool_name, tool_input, cwd)
+        if found is None:
+            return None
+        entry, path = found
+        v = {**_protected_verdict(entry, tool=tool_name), "harness": harness}
+        if record:
+            _record(v, tool=tool_name, command=f"{tool_name} {path}", session_id=session_id)
+        return v
+    except Exception as exc:
+        if record:
+            _record_fail_open(exc, harness=harness, tool=tool_name,
+                              command=f"{tool_name} {path}" if path else None,
+                              session_id=session_id)
+        return None
+
+
+# MCP tools: a command line in the arguments of any tool (a shell server's
+# {"command": "rm ~/.finops/guard-off"}), and a path argument of a tool whose
+# name says it writes (mcp__filesystem__write_file {"path": ...}). The name is
+# read a word at a time (write_file, writeFile, createDirectory), so compute
+# and output are not put.
+_MCP_NAME_WORD_RE = _Lazy(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
+_MCP_WRITE_WORDS = frozenset({
+    "write", "overwrite", "edit", "create", "move", "mv", "rename", "delete", "del", "remove",
+    "rm", "rmdir", "unlink", "patch", "append", "replace", "put", "upload", "copy", "cp",
+    "save", "mkdir", "makedirs", "touch", "chmod", "chown", "trash", "insert"})
+_MCP_DELETE_WORDS = frozenset({"move", "mv", "rename", "delete", "del", "remove", "rm",
+                               "rmdir", "unlink", "trash"})
+# A verb run into the noun it acts on: writefile, mkdirs, deletefiles.
+_MCP_NOUN_RE = _Lazy(r"(?:s|d|file|files|dir|dirs|directory|directories|text|bytes|"
+                     r"object|objects|blob|path|paths|content|contents|notebook|cell)?")
+_MCP_PATH_KEYS = frozenset({"path", "paths", "file_path", "filepath", "file", "filename",
+                            "file_name", "destination", "dest", "target", "target_path",
+                            "source", "src", "new_path", "old_path", "notebook_path",
+                            "directory", "dir"})
+_MCP_WALK_MAX = 512
+# A key the walk checks, in the JSON of the arguments it did not reach.
+_MCP_CHECKED_KEY_RE = _Lazy(
+    r'"(?:path|paths|file_path|filepath|file|filename|file_name|destination|dest|target|'
+    r'target_path|source|src|new_path|old_path|notebook_path|directory|dir|command|commands|'
+    r'cmd|script|args|arguments|argv|input|code|cli_command|shell)"\s*:', re.IGNORECASE)
+
+
+def _mcp_name_says(name: str, verbs: frozenset[str]) -> bool:
+    """Does one word of an MCP tool's name (or a verb with its noun run on)
+    say it is one of `verbs`?"""
+    for w in _MCP_NAME_WORD_RE.findall(name):
+        w = w.lower()
+        if w in verbs or any(w.startswith(v) and _MCP_NOUN_RE.fullmatch(w, len(v))
+                             for v in verbs):
+            return True
+    return False
+
+
+def _protected_mcp(tool_name: str, arguments: Any) -> dict[str, Any] | None:
+    """An ask for an MCP call that writes one of the guard's own files (a
+    path argument of a tool that writes, or a command line), or None. Metered
+    as the shell check is."""
+    from . import guard_paths
+    token = guard_paths.meter(_PATH_UNITS)
+    try:
+        return _protected_mcp_walk(tool_name, arguments)
+    except guard_paths.TooMuch:
+        return {**_too_many_paths_verdict(), "summary": tool_name.rsplit("__", 1)[-1]}
+    finally:
+        guard_paths.unmeter(token)
+
+
+def _protected_mcp_walk(tool_name: str, arguments: Any) -> dict[str, Any] | None:
+    from . import guard_paths
+    from .guard_mcp import _COMMAND_KEYS
+
+    name = tool_name.rsplit("__", 1)[-1]
+    writes = _mcp_name_says(name, _MCP_WRITE_WORDS)
+    ancestors = _mcp_name_says(name, _MCP_DELETE_WORDS)
+    entries: list[Any] | None = None
+    stack: list[tuple[Any, str, int]] = [(arguments, "", 0)]
+    seen = 0
+    while stack and seen < _MCP_WALK_MAX:
+        v, key, depth = stack.pop()
+        seen += 1
+        if isinstance(v, dict) and depth < 8:
+            # Paths and command lines last onto the stack, so first off it.
+            items = [(x, str(k).lower(), depth + 1) for k, x in v.items()]
+            stack += sorted(items, key=lambda it: it[1] in _MCP_PATH_KEYS
+                            or it[1] in _COMMAND_KEYS)
+        elif isinstance(v, list) and depth < 8:
+            stack += [(x, key, depth + 1) for x in reversed(v)]
+        elif isinstance(v, str) and v.strip():
+            if key in _COMMAND_KEYS and len(v) <= MAX_JUDGED_CHARS:
+                hit = _self_change(v) or _protected_write(v) or _oversize_code(v)
+                if hit is not None:
+                    return {**hit, "summary": f"{name} {v.strip()[:_SHOWN_VALUE_MAX]}"}
+            elif writes and key in _MCP_PATH_KEYS:
+                if entries is None:
+                    entries = guard_paths.protected()
+                e = guard_paths.match(v.strip(), entries=entries, ancestors=ancestors)
+                if e is not None:
+                    return {**_protected_verdict(e, tool=tool_name),
+                            "summary": f"{name} {v.strip()[:_SHOWN_VALUE_MAX]}"}
+    if stack and writes and (
+            any(k in _MCP_PATH_KEYS or k in _COMMAND_KEYS for _v, k, _d in stack)
+            or _MCP_CHECKED_KEY_RE.search(json.dumps([v for v, _k, _d in stack], default=str))):
+        # More arguments than the guard reads, from a tool that writes files,
+        # and a path or a command line among those left: it could be one of
+        # the guard's own files.
+        return {"decision": "ask", "action_type": "protected_write", "door": None,
+                "reason": (f"nable guard: {tool_name} writes files, and its arguments hold more "
+                           f"than the {_MCP_WALK_MAX} values the guard checks for the guard's "
+                           "own files. A human should confirm."),
+                "summary": f"{name} ({_MCP_WALK_MAX}+ values)"}
+    return None
 
 
 # ── Decision ledger ───────────────────────────────────────────────────────────
@@ -2820,6 +4345,24 @@ def _record(v: dict[str, Any], *, tool: str, command: str,
             # What the budget lens found for a priced change: the figures
             # behind an over-budget stop, or why the budget went unchecked.
             **({"budget_check": v["budget_check"]} if v.get("budget_check") else {}),
+            # The installed pack rules that matched (pack:rule), whether or
+            # not they tightened the verdict; the pack whose price book priced
+            # the change; the guard's own file a write would have changed.
+            **({"pack_rules": v["pack_rules"]} if v.get("pack_rules") else {}),
+            **({"price_book": est["price_book"]} if est.get("price_book") else {}),
+            **({"protected_path": guard_ledger.redact(v["protected_path"], limit=300)}
+               if v.get("protected_path") else {}),
+            # Who owns what the call touched, when the org model said (cited
+            # in the reason too); confirmed False marks a proposal.
+            **({"owner": {k: (guard_ledger.redact(str(x), limit=100)
+                              if isinstance(x, str) else x)
+                          for k, x in v["owner"].items()}} if v.get("owner") else {}),
+            # The org model thresholds the verdict was judged with: figures,
+            # the scope that set each, and the file each came from.
+            **({"org_thresholds": {k: (guard_ledger.redact(str(x), limit=300)
+                                       if isinstance(x, str) else x)
+                                   for k, x in v["org_thresholds"].items()}}
+               if v.get("org_thresholds") else {}),
             "policy_version": _policy_version(),
             "nable_version": __version__,
             # Known only for a deny: the call never ran. An ask is the human's
@@ -2857,8 +4400,9 @@ def _record_fail_open(exc: BaseException, *, harness: str, tool: Any, command: A
 def run_hook(stdin: Any = None, stdout: Any = None) -> int:
     """PreToolUse hook body: JSON in on stdin, optional JSON verdict on stdout.
 
-    Handles the Bash tool and MCP tools (`mcp__*`); everything else exits 0
-    with no output. Fails open by design: any error or unknown payload exits 0
+    Handles the Bash tool, MCP tools (`mcp__*`) and the file tools (Write,
+    Edit, MultiEdit, NotebookEdit: an edit to one of the guard's own files
+    asks); everything else exits 0 with no output. Fails open by design: any error or unknown payload exits 0
     with no output so the guard can never break the user's agent.
     """
     with answer_first():
@@ -2881,6 +4425,9 @@ def _run_hook(stdin: Any, stdout: Any) -> int:
         elif isinstance(tool, str) and tool.startswith("mcp__"):
             verdict = gate_mcp_call(tool, tool_input, harness="claude-code",
                                     session_id=session_id)
+        elif tool in _EDITOR_TOOLS:
+            verdict = gate_editor(tool, tool_input, cwd=payload.get("cwd"),
+                                  harness="claude-code", session_id=session_id)
         else:
             return 0
         if not verdict:
@@ -2925,10 +4472,17 @@ _HOOK_CMD = "finops guard hook"
 # exact names; anything else is an UNANCHORED JavaScript regex. So the obvious
 # "Bash|mcp__.*" would also match BashOutput, KillBash and any tool with "Bash"
 # anywhere in its name, spawning the hook for nothing. Anchored, it is exactly
-# the Bash tool plus every MCP tool (`mcp__<server>__<tool>`); run_hook then
-# returns at once for any MCP tool guard_mcp does not recognise.
-_HOOK_MATCHER = "^(Bash|mcp__.*)$"
+# the Bash tool, every MCP tool (`mcp__<server>__<tool>`) and the file tools
+# Claude Code edits with; run_hook then returns at once for any MCP tool
+# guard_mcp does not recognise, and guard_plugin answers a file edit before
+# the guard is imported unless the file is one of the guard's own
+# (guard_paths): an agent could otherwise Edit nable.org/policy.yaml or the
+# settings file that carries this hook, with no shell command to judge.
+_HOOK_MATCHER = "^(Bash|mcp__.*|Write|Edit|MultiEdit|NotebookEdit)$"
+_EDITOR_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")   # guard_plugin.EDITOR_TOOLS
 _LEGACY_MATCHER = "Bash"          # what every release before MCP coverage wrote
+# What releases before file-tool coverage wrote; install widens both.
+_OLD_MATCHERS = (_LEGACY_MATCHER, "^(Bash|mcp__.*)$")
 
 
 def matcher_covers(matcher: Any, tool_name: str) -> bool:
@@ -2951,12 +4505,14 @@ def matcher_covers(matcher: Any, tool_name: str) -> bool:
 
 
 def hook_surfaces(path: Path) -> dict[str, bool]:
-    """Which tool surfaces our installed hook actually sees in this file."""
-    covered = {"bash": False, "mcp": False}
+    """Which tool surfaces our installed hook actually sees in this file.
+    "editor" is every one of Claude Code's file tools."""
+    covered = {"bash": False, "mcp": False, "editor": False}
     for entry, _h in _read_our_hooks(path):
         m = entry.get("matcher")
         covered["bash"] |= matcher_covers(m, "Bash")
         covered["mcp"] |= matcher_covers(m, "mcp__server__call_aws")
+        covered["editor"] |= all(matcher_covers(m, t) for t in _EDITOR_TOOLS)
     return covered
 
 # The uvx form is pinned to the release that wrote it. Unpinned, `uvx --from
@@ -2968,6 +4524,35 @@ def hook_surfaces(path: Path) -> dict[str, bool]:
 # `nable guard install` from a newer release moves the pin forward in place.
 _PYPI_NAME = "finops-mcp"
 _UVX_HOOK_CMD = f"uvx --from {_PYPI_NAME}=={__version__} finops guard hook"
+
+# Claude Code blocks the tool call when a PreToolUse hook exits 2, and uvx
+# exits 2 when it cannot reach the package index (the first call after an
+# install moves the pin to a new release, offline or in a sandbox without
+# network, or after `uv cache clean`), before nable runs at all. A bare command
+# in settings.json then stops every Bash and MCP call. So the settings hook
+# ends in `; exit 0`, which means the same in sh, Git Bash and PowerShell, the
+# shells Claude Code runs hooks in. `finops guard hook` always exits 0 itself,
+# and its verdict is on stdout, which the suffix leaves alone. Releases before
+# this wrote the bare command; install wraps it in place.
+_FAIL_SAFE_SUFFIX = "; exit 0"
+# Also `|| exit 0` (the Codex spelling) and a trailing `;`: a command that
+# already ends in one of these exits 0 whatever the launcher does.
+_FAIL_SAFE_RE = re.compile(r"\s*(?:;|\|\|)\s*exit\s+0\s*;?\s*$")
+
+
+def is_fail_safe(cmd: Any) -> bool:
+    """Does this hook command exit 0 however its launcher fails?"""
+    return isinstance(cmd, str) and _FAIL_SAFE_RE.search(cmd) is not None
+
+
+def _bare(cmd: str) -> str:
+    """A hook command without the fail-safe wrapper, however it was spelled."""
+    return _FAIL_SAFE_RE.sub("", cmd)
+
+
+def _fail_safe(cmd: str) -> str:
+    """The Claude Code settings hook for `cmd`: wrapped once, never twice."""
+    return f"{_bare(cmd)}{_FAIL_SAFE_SUFFIX}"
 
 
 def hook_pin(cmd: str) -> str | None:
@@ -3031,7 +4616,11 @@ def _hook_command() -> str:
     with command-not-found on every Bash call. A persistent binary is best. An
     ephemeral one is worse than none, because it fails open and lies about it, so
     those fall through to the uvx form, which re-resolves at run time (to this
-    release, see _UVX_HOOK_CMD, not to whatever PyPI has that day)."""
+    release, see _UVX_HOOK_CMD, not to whatever PyPI has that day).
+
+    This is the bare command. Each harness wraps it the way its shell and its
+    exit-code rules need: _claude_hook_command for Claude Code's settings,
+    guard_adapters for the others."""
     import shutil
     found = shutil.which("finops")
     if found and not _is_ephemeral(found):
@@ -3039,6 +4628,19 @@ def _hook_command() -> str:
         # but user venvs can).
         return f'"{found}" guard hook' if " " in found else f"{found} guard hook"
     return _UVX_HOOK_CMD
+
+
+def _claude_hook_command() -> str:
+    """What install writes into Claude Code's settings: _hook_command, fail-safe
+    (see _FAIL_SAFE_SUFFIX). The binary form gets the suffix too: a missing
+    binary exits 127, which Claude Code only reports, but one form is simpler
+    to recognise than two, and a wrapper script there could exit 2."""
+    return _fail_safe(_hook_command())
+
+
+def hook_form() -> str:
+    """"uvx" or "binary": which form install writes on this machine."""
+    return "uvx" if _bare(_hook_command()) == _UVX_HOOK_CMD else "binary"
 
 
 def _settings_path(global_scope: bool) -> Path:
@@ -3179,24 +4781,48 @@ def pinned_elsewhere_hook_command(path: Path) -> str | None:
     return None
 
 
+def blocking_hook_command(path: Path) -> str | None:
+    """Our installed hook command, when it is the bare form releases before
+    the fail-safe wrapper wrote: a uvx that cannot reach the package index
+    exits 2 and Claude Code blocks the tool call (see _FAIL_SAFE_SUFFIX).
+    None when the hook is absent or already fail-safe."""
+    for _entry, h in _read_our_hooks(path):
+        if not is_fail_safe(h["command"]):
+            return h["command"]
+    return None
+
+
 def _stale(cmd: str) -> bool:
-    """Should install() rewrite this existing hook command in place?
+    """Should install() point this existing hook command at a new one?
 
     Dead, unpinned, or pinned to a release other than the one running the
     install. Re-running install is an explicit choice of release, so the pin
-    follows it; a healthy binary-path hook is never touched."""
+    follows it; a healthy binary-path hook keeps its program (see _upgraded)."""
     return not _command_runs(cmd) or hook_pin(cmd) in ("unpinned", "other")
 
 
-def _widen_matcher(pre: list, entry: dict, hook: dict) -> bool:
-    """Move our hook from the Bash-only matcher earlier releases wrote to one
-    that also covers MCP tools. Returns True when something changed.
+def _upgraded(cmd: str) -> str | None:
+    """The command install() writes over this existing one of ours, or None
+    to leave it as found. A stale one is re-resolved; a healthy one in the
+    bare form keeps its program and gains the fail-safe wrapper."""
+    if _stale(cmd):
+        return _claude_hook_command()
+    if not is_fail_safe(cmd):
+        return _fail_safe(cmd)
+    return None
 
-    Only the exact "Bash" we wrote is upgraded: any other matcher is a choice
-    someone made by hand, and it stays theirs. When our hook shares that entry
-    with someone else's, widening the entry would start running THEIR hook on
-    every MCP call, so ours moves to an entry of its own instead."""
-    if entry.get("matcher") != _LEGACY_MATCHER:
+
+def _widen_matcher(pre: list, entry: dict, hook: dict) -> bool:
+    """Move our hook from a matcher earlier releases wrote ("Bash", then
+    "^(Bash|mcp__.*)$") to the one that also covers MCP and the file tools.
+    Returns True when something changed.
+
+    Only a matcher we wrote is upgraded: any other is a choice someone made
+    by hand, and it stays theirs. When our hook shares that entry with
+    someone else's, widening the entry would start running THEIR hook on
+    every MCP call and file edit, so ours moves to an entry of its own
+    instead."""
+    if entry.get("matcher") not in _OLD_MATCHERS:
         return False
     if all(isinstance(h, dict) and _is_our_command(h.get("command")) for h in entry["hooks"]):
         entry["matcher"] = _HOOK_MATCHER
@@ -3214,9 +4840,9 @@ def install(global_scope: bool = False) -> Path:
     the 0.8.195 changelog told every uvx user the same. Both were promises this
     function did not keep: it returned early on any existing entry, so the dead
     hook stayed dead and the telemetry counted it as "repaired". Our own entry
-    is now rewritten in place when it is stale, or when its matcher predates
-    MCP coverage, keeping its position and every other hook in the file
-    exactly as found."""
+    is now rewritten in place when it is stale, when it predates the fail-safe
+    wrapper, or when its matcher predates MCP coverage, keeping its position
+    and every other hook in the file exactly as found."""
     path = _settings_path(global_scope)
     settings = _load_settings(path)
     pre = _hook_list(settings, path, create=True)
@@ -3225,9 +4851,9 @@ def install(global_scope: bool = False) -> Path:
         changed = False
         for entry, h in ours:
             changed = _widen_matcher(pre, entry, h) or changed
-            if not _stale(h["command"]):
+            cmd = _upgraded(h["command"])
+            if cmd is None:
                 continue
-            cmd = _hook_command()
             h["command"] = cmd
             old = h.get("timeout")
             h["timeout"] = max(old, _timeout_for(cmd)) if isinstance(old, int) else _timeout_for(cmd)
@@ -3235,7 +4861,7 @@ def install(global_scope: bool = False) -> Path:
         if not changed:
             return path
     else:
-        cmd = _hook_command()
+        cmd = _claude_hook_command()
         pre.append({
             "matcher": _HOOK_MATCHER,
             "hooks": [{"type": "command", "command": cmd, "timeout": _timeout_for(cmd)}],
@@ -3337,8 +4963,10 @@ def _adapter_rows() -> list[dict[str, Any]]:
 def doctor() -> dict[str, Any]:
     """Which surfaces the guard actually covers on this machine, and what it
     does not. Read-only apart from the ledger anchor (guard_ledger.check),
-    which a clean check moves forward: it inspects settings files and the ledger, runs
-    nothing, and calls no cloud API."""
+    which a clean check moves forward: it inspects settings files and the ledger
+    and calls no cloud API. It runs nothing but what the guard itself would
+    start: with a Cursor Admin API key and an old or missing Cursor cache, the
+    background refresh (background_refresh), which it does not wait for."""
     from . import guard_ledger
     from .guard_mcp import MCP_RULES
 
@@ -3352,7 +4980,8 @@ def doctor() -> dict[str, Any]:
             cmd = ours[0][1]["command"]
             surf = hook_surfaces(p)
             row.update(command=cmd, runs=_command_runs(cmd), pin=hook_pin(cmd) or "binary",
-                       bash=surf["bash"], mcp=surf["mcp"])
+                       bash=surf["bash"], mcp=surf["mcp"], editor=surf["editor"],
+                       fail_safe=is_fail_safe(cmd))
         rows.append(row)
     adapter_rows = _adapter_rows()
     rows += adapter_rows
@@ -3376,6 +5005,9 @@ def doctor() -> dict[str, Any]:
     if any(r.get("mcp") for r in live):
         covered.append(f"Claude Code: MCP tool calls ({n_tools} recognised tools: "
                        + ", ".join(_FAMILY_LABELS.get(f, f) for f in sorted(families)) + ")")
+    if any(r.get("editor") for r in live):
+        covered.append("Claude Code: Write, Edit, MultiEdit and NotebookEdit on the guard's "
+                       "own files")
     if not live:
         gaps.append("Claude Code: no working guard hook")
         fix("nable guard install", "this project; add --global for every project")
@@ -3392,12 +5024,21 @@ def doctor() -> dict[str, Any]:
             # sees MCP covers it; only a machine where none does has a gap.
             gaps.append(f"Claude Code ({r['scope']}): MCP tool calls (the hook only sees Bash)")
             fix(f"nable guard install{flag}", "widens the hook to MCP tools")
+        if not r.get("editor") and not any(x.get("editor") for x in live):
+            gaps.append(f"Claude Code ({r['scope']}): file edits to the guard's own files "
+                        "(the hook does not see Write, Edit, MultiEdit or NotebookEdit)")
+            if r.get("mcp") or any(x.get("mcp") for x in live):
+                # Otherwise the MCP repair above is the same install, and widens both.
+                fix(f"nable guard install{flag}", "widens the hook to Claude Code's file tools")
         if r.get("pin") == "unpinned":
             fix(f"nable guard install{flag}", "pins the hook to this release instead of "
                 "the newest PyPI release on every call")
         elif r.get("pin") == "other":
             fix(f"nable guard install{flag}", "pins the hook to this release instead of "
                 f"another release ({hook_release(r['command']) or 'unknown'})")
+        if r.get("fail_safe") is False:
+            fix(f"nable guard install{flag}", "lets tool calls through when the hook cannot "
+                "start (uvx offline exits 2, which blocks every Bash and MCP call)")
 
     for name, (label, what) in _ADAPTER_SURFACES.items():
         mine = [r for r in adapter_rows if r["harness"] == name]
@@ -3439,7 +5080,14 @@ def doctor() -> dict[str, Any]:
                 "command line, or the AI budget stop applies)")
     gaps.append("the AI budget stop on Claude Code's built-in tools (Edit, Write, Read, "
                 "WebFetch, Task and the like): in Claude Code it covers Bash and MCP "
-                "tool calls only")
+                "tool calls only; the file tools are checked for the guard's own files "
+                "and nothing else")
+    gaps.append("writes to the guard's own files that the guard cannot see coming: a path "
+                "built at run time ($(...), a loop variable), a script the agent runs, "
+                "git reset or stash, an archive unpacked over them")
+    for name, (label, _what) in _ADAPTER_SURFACES.items():
+        if any(r["harness"] == name and r.get("runs") for r in adapter_rows):
+            gaps.append(f"{label}: {_EDITOR_GAPS[name]}")
 
     ledger = guard_ledger.check()
     if not ledger["ok"]:
@@ -3458,7 +5106,16 @@ def doctor() -> dict[str, Any]:
                     "could not be written (permissions, a full disk)")
         fix(f"check what holds {ledger['path']} (lsof), then remove {lost['path']}",
             "records the guard could not write")
-    budgets = budget_status()
+    org = org_status()
+    org_team = org.get("team") if org.get("team_source") != "FINOPS_GUARD_TEAM" else None
+    if org_team:
+        covered.append(f"priced changes here as team {org_team} (the org model's confirmed "
+                       f"owner of this repo path): its budgets and thresholds")
+    if org.get("error"):
+        gaps.append(f"the org model: it could not be read ({org['error']}), so the guard "
+                    "judges as if there were none")
+        fix("nable org status", "shows which org file is at fault")
+    budgets = budget_status(org_team)
     if budgets["state"] == "fresh" and budgets["enforced"]:
         n = len(budgets["enforced"])
         covered.append(f"priced changes against {n} cloud budget{'s' if n != 1 else ''} "
@@ -3481,10 +5138,22 @@ def doctor() -> dict[str, Any]:
     for row in budgets["not_enforced"]:
         gaps.append(f"the '{row['name']}' budget ({row['scope']}): the guard cannot tell "
                     f"which changes are in it; set {row['needs']} where the agent runs")
+    from . import background_refresh
+    refresh = background_refresh.status(start=True)
+    _doctor_cursor(refresh, covered, gaps, fix)
     from .policy import policy_problems
     problems = policy_problems()
     for problem in problems:
         fix("correct the policy setting", problem)
+    packs = _doctor_packs(covered, gaps, fix)
+    try:
+        from . import guard_paths
+        protected = [e.as_dict() for e in guard_paths.protected()]
+    except Exception as exc:
+        protected = []
+        gaps.append(f"the guard's own files: they could not be listed ({type(exc).__name__}), "
+                    "so writes to them may not ask")
+    editor_tools = _editor_coverage(rows)
     fixes = [f"{cmd}  ({'; '.join(why)})" if why else cmd for cmd, why in todo.items()]
     fixes.append("give agents read-only cloud credentials; keep write access behind a human")
 
@@ -3496,11 +5165,104 @@ def doctor() -> dict[str, Any]:
         "mcp_tools": families,
         "ledger": ledger,
         "budgets": budgets,
+        "org": org,
+        "background_refresh": refresh,
         "policy_problems": problems,
+        "protected_paths": protected,
+        "editor_tools": editor_tools,
+        "packs": packs,
         "recommendations": fixes,
         "seatbelt": SEATBELT,
         "version": __version__,
     }
+
+
+# Why each other harness's file edits are not checked, from what the adapter
+# (guard_adapters.py) knows of its hook protocol. Their shell tools are, so
+# `echo x > nable.org/policy.yaml` asks everywhere the guard is installed.
+_EDITOR_GAPS = {
+    "cursor": ("file edits to the guard's own files (Cursor's documented hooks run after a "
+               "file edit, afterFileEdit, or before a read, beforeReadFile; nothing can stop "
+               "an edit before it happens)"),
+    "codex": ("file edits to the guard's own files (the guard's Codex hook is on Bash and "
+              "MCP calls; Codex's file edits are not among the tool names nable knows it "
+              "sends to a hook)"),
+    "copilot": ("file edits to the guard's own files (the guard's Copilot hook reads the "
+                "bash and powershell tools only)"),
+    "gemini": ("file edits to the guard's own files (the guard's Gemini CLI hook matches "
+               "run_shell_command only)"),
+    "cline": ("file edits to the guard's own files (the guard's Cline hook reads "
+              "run_commands and execute_command only)"),
+}
+
+
+def _editor_coverage(rows: list[dict[str, Any]]) -> dict[str, str]:
+    """Per harness: whether an edit to one of the guard's own files through
+    the harness's file tools asks ("covered"), or why not."""
+    out: dict[str, str] = {}
+    claude = [r for r in rows if r["harness"] == "claude-code" and r.get("runs")]
+    if any(r.get("editor") for r in claude):
+        out["claude-code"] = "covered"
+    elif claude:
+        out["claude-code"] = ("not covered: the installed hook's matcher predates the file "
+                              "tools (nable guard install widens it)")
+    else:
+        out["claude-code"] = "not covered: no working guard hook"
+    for name in _ADAPTER_SURFACES:
+        out[name] = "not covered: " + _EDITOR_GAPS[name]
+    return out
+
+
+def _doctor_packs(covered: list[str], gaps: list[str], fix: Any) -> dict[str, Any]:
+    """The doctor's word on installed packs in the guard: the guard rules
+    and price books in effect, and any pack it is judging without."""
+    from . import guard_packs
+    st = guard_packs.status()
+    rules, books = st["guard_rules"], st["price_books"]
+    if rules:
+        n = len(rules)
+        covered.append(f"{n} guard rule{'s' if n != 1 else ''} from installed packs "
+                       f"({', '.join(sorted({r['pack'] for r in rules}))}); they only tighten")
+    if books:
+        covered.append(f"prices from {len(books)} price book rate"
+                       f"{'s' if len(books) != 1 else ''} in installed packs "
+                       f"({', '.join(sorted({b['pack'] for b in books}))}), where one covers "
+                       "the SKU; verdicts judge at the higher of list and book rate")
+    for problem in st.get("guard_problems") or []:
+        gaps.append(f"an installed pack the guard judges without: {problem}")
+        fix("nable pack audit", "says what changed in the pack since it was approved")
+    return st
+
+
+def _doctor_cursor(refresh: dict[str, Any], covered: list[str], gaps: list[str],
+                   fix: Any) -> None:
+    """The doctor's word on Cursor usage in the AI budget: how old the Admin
+    API read the guard counts is, and what is refreshing it. Nothing without
+    a key: then Cursor usage is not read at all (`nable ai-budget` says so)."""
+    from .budget.summary import age_words
+    cursor = refresh["cursor"]
+    if not cursor.get("enabled"):
+        return
+    what = "Cursor usage in the AI budget"
+    busy = "; a refresh is running in the background" if cursor.get("refreshing") else ""
+    age = cursor.get("age_hours")
+    if cursor.get("error"):
+        counted = (f"counts the read from {age_words(age)} ago" if age is not None
+                   else "counts no Cursor usage")
+        gaps.append(f"{what}: the last Admin API read failed ({cursor['error']}), so the "
+                    f"guard {counted} until one succeeds")
+        fix("nable ai-budget", "reads Cursor usage now, once the key or the network is fixed")
+    elif age is None:
+        gaps.append(f"{what}: no Admin API read yet, so the guard counts none{busy}")
+    elif cursor.get("stale"):
+        gaps.append(f"{what}: the guard is counting an Admin API read {age_words(age)} "
+                    f"old, past the {cursor['ttl_hours']:g} hour it is good for{busy}")
+    else:
+        covered.append(f"{what} (Admin API read {age_words(age)} ago)")
+    if not refresh.get("enabled") and cursor.get("stale"):
+        fix("nable ai-budget", "reads Cursor usage now; background refresh is off "
+            "(FINOPS_GUARD_BACKGROUND_REFRESH=0), so the guard's Cursor figure is only "
+            "as fresh as the last read outside the hook")
 
 
 def _harness_present(name: str) -> bool:
