@@ -2,6 +2,48 @@
 
 All notable changes to finops-mcp (nable).
 
+## 0.10.0
+
+Decisions become policy: nable stops asking the same thing twice.
+
+- **It knows how each ask was answered.** A post-tool hook in Claude Code,
+  Cursor (shell commands) and GitHub Copilot records that an asked command
+  ran, linked to the ask in the ledger. An ask that nothing followed reads
+  as declined once its session goes quiet for 30 minutes. `nable guard
+  report` shows approved, declined and unknown per action class and scope.
+- **Inferred thresholds.** When people approve the same kind of change in
+  the same scope at least 5 times over at least 7 days, with nothing
+  declined or reverted, nable proposes one threshold for that scope, with
+  the evidence as the question ("approved 6 times since Sep 19, max
+  $1,121/mo, none declined or reverted"). Three declines propose asking
+  sooner. A proposal to loosen defaults to no; one-way doors always ask.
+  Asks during a change freeze are not evidence either way. `nable learn
+  list|show|infer|rollback|restore` shows and manages what was learned;
+  rollback and restore take a person.
+- **Change freezes.** `nable org set freeze --scope environment:prod
+  --start ... --end ... --reason "Black Friday"`. During a freeze every
+  priced change and one-way door in its scope asks, or is denied when a
+  person confirmed the freeze in deny mode, whatever the thresholds say.
+- **Approval chains.** `nable org set approval --scope team:payments
+  --action-class rightsizing --approver github:alice`. Remediation pull
+  requests request those reviewers, Jira and Linear tickets add them as
+  watchers, and a required change ticket gets a placeholder.
+- **One-time approval where the agent cannot ask.** In Codex CLI, Gemini
+  CLI, Cline and the Copilot cloud agent an ask has always been a deny. The
+  deny now carries an id: a person runs `nable guard approve <id>` in their
+  own terminal and the identical command is let through once within 15
+  minutes, recorded with who approved. An agent cannot approve, and a deny
+  set by policy is never approvable. On a terminal the command shows the
+  call, its directory and why it was stopped, and approves only on a yes.
+- Fixed in a pre-release review: a freeze time past the last UTC instant
+  switched the org model off in the hook; an inferred "tighten" for a team
+  could lift an environment's lower threshold, and was offered with a yes;
+  an agent could record outcomes itself to turn a no into a yes; a retry
+  the person declined counted as an approval; an MCP approval carried
+  across directories; terminal escapes in a command could disguise what a
+  person approved; runs with permissions bypassed counted as approvals; and
+  `$(which nable) guard off` and similar spellings skipped the self rules.
+
 ## 0.9.0
 
 nable starts learning each org, and grows an ecosystem.
